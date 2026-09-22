@@ -1,0 +1,1489 @@
+import os
+import time
+import json
+import re
+import threading
+from datetime import date, datetime, time as dtime
+from contextlib import contextmanager
+import psycopg2
+from psycopg2 import pool
+import requests
+import twstock
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+DB_URL = os.getenv("DATABASE_URL")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+FUGLE_TOKEN = os.getenv("FUGLE_TOKEN")
+
+if not all([BOT_TOKEN, CHAT_ID, DB_URL, GEMINI_API_KEY, FUGLE_TOKEN]):
+    print("⚠️ 警告：環境變數讀取不完整，請檢查 .env 檔案設定！")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+db_pool = None
+try:
+    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DB_URL)
+    print("✅ 資料庫連線池 (ThreadedConnectionPool) 初始化成功")
+except Exception as e:
+    print(f"❌ 資料庫連線池初始化失敗: {e}")
+
+@contextmanager
+def get_db_connection():
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        yield conn
+    finally:
+        if conn and db_pool:
+            db_pool.putconn(conn)
+
+DEFAULT_STOP_LOSS_PERCENT = 3.0
+DEFAULT_TAKE_PROFIT_PERCENT = 11.0
+DEFAULT_TRAILING_STOP_PERCENT = 6.0
+DEFAULT_TRAILING_ACTIVATION_PERCENT = 3.0
+DEFAULT_WARNING_BUFFER_PERCENT = 1.0
+
+CN_NUM_MAP = {
+    "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, 
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10
+}
+
+def get_stock_info(identifier: str):
+    if not identifier:
+        return None, None
+    identifier = str(identifier).strip()
+    
+    if identifier in twstock.codes:
+        return identifier, twstock.codes[identifier].name
+    
+    if len(identifier) == 5 and identifier.isdigit():
+        base_code = identifier[:4]
+        cb_suffix = identifier[4]
+        suffix_map = {'1': '一', '2': '二', '3': '三', '4': '四', '5': '五', '6': '六', '7': '七', '8': '八', '9': '九', '0': '十'}
+        name_suffix = suffix_map.get(cb_suffix, 'CB')
+        if base_code in twstock.codes:
+            cb_name = f"{twstock.codes[base_code].name}{name_suffix}"
+            return identifier, cb_name
+        return identifier, f"可轉債{identifier}"
+
+    for code, info in twstock.codes.items():
+        if identifier in info.name or info.name in identifier:
+            return code, info.name
+            
+    return identifier, identifier
+
+def is_market_open() -> bool:
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    market_start = dtime(9, 0, 0)
+    market_end = dtime(13, 45, 0)
+    return market_start <= now.time() <= market_end
+
+def is_market_closing_time() -> bool:
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    return dtime(13, 40, 0) <= now.time() <= dtime(13, 45, 0)
+
+def init_db_schema():
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                ALTER TABLE position_lots 
+                ADD COLUMN IF NOT EXISTS warning_buffer_percent NUMERIC DEFAULT 1.0,
+                ADD COLUMN IF NOT EXISTS warning_sl_price NUMERIC,
+                ADD COLUMN IF NOT EXISTS warning_tp_price NUMERIC,
+                ADD COLUMN IF NOT EXISTS ts_activation_percent NUMERIC DEFAULT 3.0;
+                
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    report_date DATE PRIMARY KEY,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_history (
+                    history_id SERIAL PRIMARY KEY,
+                    lot_id INT,
+                    stock_code VARCHAR(20),
+                    stock_name VARCHAR(50),
+                    action_type VARCHAR(20),
+                    quantity INT,
+                    price NUMERIC,
+                    realized_pnl NUMERIC,
+                    realized_pnl_pct NUMERIC,
+                    exit_reason VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+            cur.close()
+    except Exception as e:
+        print(f"⚠️ 初始化 schema 提示：{e}")
+
+def send_telegram(text: str, silent: bool = False, reply_markup=None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_notification": silent
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    headers = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
+    for _ in range(3):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=8)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            time.sleep(0.5)
+    return None
+
+def get_market_quote(code: str):
+    code, name = get_stock_info(code)
+    if not code:
+        return None, None, None, None
+
+    if len(code) == 5 and code.isdigit():
+        try:
+            url_fugle_cb = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{code}"
+            headers = {"X-API-KEY": FUGLE_TOKEN, "Connection": "close"}
+            resp_f = requests.get(url_fugle_cb, headers=headers, timeout=5)
+            if resp_f.status_code == 200:
+                d = resp_f.json()
+                price = d.get("closePrice") or d.get("lastUpdatedPrice") or (d.get("trade", {}).get("price") if isinstance(d.get("trade"), dict) else None)
+                if price:
+                    return name, float(price), float(d.get("highPrice", price)), float(d.get("lowPrice", price))
+        except Exception:
+            pass
+
+        for suffix in [".TWO", ".TW"]:
+            try:
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}"
+                headers = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
+                resp = requests.get(url, headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    result = data.get("chart", {}).get("result")
+                    if result:
+                        meta = result[0]["meta"]
+                        price = meta.get("regularMarketPrice")
+                        if price:
+                            return name, float(price), float(meta.get("regularMarketDayHigh", price)), float(meta.get("regularMarketDayLow", price))
+            except Exception:
+                pass
+
+    if is_market_open() and len(code) == 4:
+        try:
+            url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{code}"
+            headers = {"X-API-KEY": FUGLE_TOKEN, "Connection": "close"}
+            resp = requests.get(url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                d = resp.json()
+                price = (
+                    d.get("closePrice") 
+                    or d.get("lastUpdatedPrice") 
+                    or d.get("avgPrice") 
+                    or (d.get("trade", {}).get("price") if isinstance(d.get("trade"), dict) else None)
+                )
+                high = d.get("highPrice")
+                low = d.get("lowPrice")
+                if price:
+                    return name, float(price), float(high) if high else float(price), float(low) if low else float(price)
+        except Exception:
+            pass
+
+    for suffix in [".TW", ".TWO"]:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}"
+            headers = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
+            resp = requests.get(url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data.get("chart", {}).get("result")
+                if result:
+                    meta = result[0]["meta"]
+                    price = meta.get("regularMarketPrice")
+                    high = meta.get("regularMarketDayHigh")
+                    low = meta.get("regularMarketDayLow")
+                    if price:
+                        return name, float(price), float(high) if high else float(price), float(low) if low else float(price)
+        except Exception:
+            pass
+
+    return name, None, None, None
+
+def get_portfolio_summary_text(filter_keyword: str = None, sort_by_profit: bool = False) -> str:
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            today = date.today()
+
+            cur.execute("""
+                SELECT lot_id, stock_code, stock_name, buy_price, quantity, 
+                       stop_loss_price, take_profit_price, stop_loss_percent, take_profit_percent, 
+                       trailing_stop_percent, warning_buffer_percent, warning_sl_price, warning_tp_price,
+                       ts_activation_percent
+                FROM position_lots
+                WHERE monitoring_status = 'MONITORING'
+                ORDER BY lot_id ASC;
+            """)
+            lots = cur.fetchall()
+
+            if not lots:
+                cur.close()
+                return "📋 【最新持倉狀況】\n目前已無任何監控中的持倉批次。"
+
+            cur.execute("""
+                SELECT lot_id, event_type 
+                FROM notification_records 
+                WHERE trade_date = %s;
+            """, (today,))
+            notif_rows = cur.fetchall()
+            cur.close()
+
+        triggered_map = {}
+        for r_lot_id, r_event in notif_rows:
+            if r_lot_id not in triggered_map or triggered_map[r_lot_id].startswith("APPROACHING"):
+                triggered_map[r_lot_id] = r_event
+
+        parsed_items = []
+        for r in lots:
+            lot_id = r[0]
+            code = r[1]
+            _, name = get_stock_info(code)
+            buy_price = float(r[3])
+            qty = r[4]
+            sl_price = float(r[5])
+            tp_price = float(r[6])
+            sl_pct = abs(float(r[7]))
+            tp_pct = abs(float(r[8]))
+            ts_p = float(r[9]) if r[9] else DEFAULT_TRAILING_STOP_PERCENT
+            wb_p = float(r[10]) if r[10] is not None else DEFAULT_WARNING_BUFFER_PERCENT
+            w_sl_p = float(r[11]) if r[11] is not None else None
+            w_tp_p = float(r[12]) if r[12] is not None else None
+            ts_act_p = float(r[13]) if r[13] is not None else DEFAULT_TRAILING_ACTIVATION_PERCENT
+
+            if filter_keyword:
+                kw = filter_keyword.strip().lower()
+                matched_kw = (kw in code.lower() or kw in name.lower() or kw == str(lot_id))
+                if not matched_kw:
+                    continue
+
+            _, cur_price, _, _ = get_market_quote(code)
+            if cur_price is not None:
+                cur_price = float(cur_price)
+                diff_val = cur_price - buy_price
+                diff_pct = (diff_val / buy_price) * 100
+                sign = "+" if diff_val >= 0 else ""
+                price_line = f"  最新成交：{cur_price:.1f} 元 ({sign}{diff_pct:.2f}%)"
+            else:
+                cur_price = buy_price
+                diff_pct = 0.0
+                price_line = "  最新成交：查無即時行情"
+
+            event_type = triggered_map.get(lot_id)
+            icon = "🔹"
+            status_line = ""
+
+            if event_type == 'STOP_LOSS':
+                icon = "🔴"
+                status_line = "\n\n  今日狀態：🚨 盤中已觸發停損防線，請儘速處理！"
+            elif event_type == 'TAKE_PROFIT':
+                icon = "🟡"
+                status_line = "\n\n  今日狀態：🎉 盤中已觸發停利目標，可分批入袋！"
+            elif event_type == 'TRAILING_STOP':
+                icon = "🟠"
+                status_line = "\n\n  今日狀態：⚠️ 盤中已觸發移動停利，請獲利入袋！"
+            elif event_type == 'APPROACHING_STOP_LOSS':
+                icon = "🔸"
+                status_line = "\n\n  今日狀態：⚠️ 盤中逼近停損防線"
+            elif event_type == 'APPROACHING_TAKE_PROFIT':
+                icon = "🔸"
+                status_line = "\n\n  今日狀態：🎯 盤中逼近停利目標"
+
+            warn_info = []
+            if w_sl_p:
+                warn_info.append(f"跌至{w_sl_p:.1f}元")
+            if w_tp_p:
+                warn_info.append(f"漲至{w_tp_p:.1f}元")
+            if not warn_info:
+                warn_line = f"  預警通知：{wb_p:.1f}%"
+            else:
+                warn_line = f"  預警通知：{' / '.join(warn_info)}"
+
+            item_text = (
+                f"{icon} 【第 {lot_id} 筆】| {name} ({code})\n"
+                f"  買入成本：{buy_price:.1f} 元 ({qty}張)\n"
+                f"{price_line}\n"
+                f"  停損防線：{sl_price:.1f} 元 (-{sl_pct:.1f}%)\n"
+                f"  停利目標：{tp_price:.1f} 元 (+{tp_pct:.1f}%)\n"
+                f"  移動停利：{ts_p:.1f}%（獲利達 +{ts_act_p:.1f}% 啟動）\n"
+                f"{warn_line}"
+                f"{status_line}"
+            )
+            parsed_items.append({"text": item_text, "profit_pct": diff_pct})
+
+        if not parsed_items:
+            return f"📋 【最新持倉監控列表】\n\n找不到符合「{filter_keyword}」的監控中持倉。"
+
+        if sort_by_profit:
+            parsed_items.sort(key=lambda x: x["profit_pct"], reverse=True)
+
+        final_texts = [item["text"] for item in parsed_items]
+        header = f"📋 【最新持倉監控列表】{'（已依獲利排序）' if sort_by_profit else ''}"
+        return header + "\n\n" + "\n----------------------------\n".join(final_texts)
+
+    except Exception as e:
+        return f"❌ 讀取最新庫存失敗：{e}"
+
+def get_show_portfolio_markup():
+    return {
+        "inline_keyboard": [
+            [{"text": "📋 顯示全部庫存清單", "callback_data": "SHOW_ALL_PORTFOLIO"}]
+        ]
+    }
+
+def clean_input_text(text: str) -> str:
+    t = text.strip()
+    t = re.sub(r'^[地弟低]\s*(\d+|[一二兩三四五六七八九十]+)', r'第\1', t)
+    t = re.sub(r'(?<=\s)[地弟低]\s*(\d+|[一二兩三四五六七八九十]+)', r'第\1', t)
+
+    for mis in ['玉井', '玉景', '預井', '預鏡', '玉鏡', '預緊', '於警', '預景', '魚警']:
+        t = t.replace(mis, '預警')
+
+    for mis in ['移動挺立', '移動停地', '一動停利', '移動停力', '一動挺立']:
+        t = t.replace(mis, '移動停利')
+    for mis in ['挺立', '挺利', '廷立', '停力', '停一', '挺力', '停例', '聽力', '停立']:
+        t = t.replace(mis, '停利')
+    for mis in ['停筍', '聽損', '廷損', '停准', '停省']:
+        t = t.replace(mis, '停損')
+
+    t = re.sub(r'[—–－\-]+', ' ', t)
+    t = t.replace('，', ' ').replace('。', ' ')
+    return re.sub(r'\s+', ' ', t)
+
+def ask_gemini_fallback(user_text: str) -> dict:
+    prompt = f"""
+分析股票交易對話，輸出純 JSON，勿加任何格式標記：
+支援 action: ADD_LOT, SELL_LOT, SELL_MULTI_LOTS, DELETE_LOT, UPDATE_SETTINGS, SET_WARNING_BUFFER, SET_WARNING_PRICE, QUERY_PORTFOLIO, GET_PRICE, UNKNOWN
+注意同音字：玉井/預景=預警, 兩趴=2%。
+用戶訊息："{user_text}"
+"""
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        return json.loads(response.text.strip())
+    except Exception:
+        return {"action": "UNKNOWN"}
+
+def extract_trade_intent(user_text: str):
+    clean_text = clean_input_text(user_text)
+
+    is_query_price = any(k in clean_text for k in [
+        "成交價", "現價", "股價", "市價", "最新價", "多少", "價格是多少", "行情", "查價", "報價", "收盤價"
+    ]) and not any(k in clean_text for k in ["買", "賣", "刪", "改"])
+
+    code = None
+    cb_match = re.findall(r'(?:\D|^)(\d{5})(?:\D|$)', clean_text)
+    stock_match = re.findall(r'(?:\D|^)(\d{4})(?:\D|$)', clean_text)
+    if cb_match:
+        code = cb_match[0]
+    elif stock_match:
+        code = stock_match[0]
+
+    if code and is_query_price:
+        _, name = get_stock_info(code)
+        _, m_price, _, _ = get_market_quote(code)
+        return {"action": "GET_PRICE", "stock_code": code, "stock_name": name, "market_price": m_price}
+
+    if any(k in clean_text for k in ["查詢", "查", "持倉", "庫存", "持股"]) and not any(k in clean_text for k in ["成交價", "現價", "股價", "多少"]):
+        sort_profit = any(k in clean_text for k in ["排序", "報酬", "獲利", "績效"])
+        filter_kw = None
+        if code:
+            filter_kw = code
+        else:
+            for word in clean_text.split():
+                if word not in ["查詢", "查", "持倉", "庫存", "持股", "全部"]:
+                    filter_kw = word
+                    break
+
+        return {
+            "action": "QUERY_PORTFOLIO_FILTERED",
+            "filter_keyword": filter_kw,
+            "sort_by_profit": sort_profit
+        }
+
+    lot_matches = re.findall(r'(?:第|地|弟|低|lot\s*#?)\s*(\d+|[一二兩三四五六七八九十]+)\s*筆?', clean_text, re.IGNORECASE)
+    target_lot_ids = []
+    for raw in lot_matches:
+        raw_val = raw.lower()
+        if raw_val.isdigit():
+            target_lot_ids.append(int(raw_val))
+        elif raw_val in CN_NUM_MAP:
+            target_lot_ids.append(CN_NUM_MAP[raw_val])
+    target_lot_ids = list(dict.fromkeys(target_lot_ids))
+
+    is_sell = any(k in clean_text for k in ["賣", "出", "沖", "平倉", "賣掉", "出脫", "砍掉", "出清"])
+    is_delete = any(k in clean_text for k in ["刪除", "移除", "刪掉", "取消", "撤銷", "作廢"])
+    is_buy = any(k in clean_text for k in ["買", "進", "入", "建倉", "加碼"])
+    is_modify = any(k in clean_text for k in ["改", "修", "調", "設"])
+
+    name = None
+    temp_text = clean_text
+
+    if not code:
+        for c_code, info in twstock.codes.items():
+            if info.name in clean_text:
+                code = c_code
+                name = info.name
+                temp_text = clean_text.replace(info.name, ' ')
+                break
+
+    if "預警" in clean_text and any(k in clean_text for k in ["元", "塊", "到", "至", "跌到", "漲到", "價格"]):
+        if not re.search(r'(\d+(?:\.\d+)?|[一二兩三四五六七八九十])\s*(?:%|趴)', clean_text):
+            w_sl = None
+            w_tp = None
+            sl_warn_match = re.search(r'(?:跌到|跌至|跌破|停損|低於)\s*(\d+(?:\.\d+)?)\s*元?', clean_text)
+            if sl_warn_match:
+                w_sl = float(sl_warn_match.group(1))
+
+            tp_warn_match = re.search(r'(?:漲到|漲至|突破|停利|高於|到達)\s*(\d+(?:\.\d+)?)\s*元?', clean_text)
+            if tp_warn_match:
+                w_tp = float(tp_warn_match.group(1))
+
+            if not w_sl and not w_tp:
+                p_match = re.search(r'(\d+(?:\.\d+)?)\s*元?\s*預警', clean_text)
+                if p_match:
+                    val = float(p_match.group(1))
+                    return {
+                        "action": "SET_WARNING_PRICE",
+                        "general_price": val,
+                        "lot_id": target_lot_ids[0] if target_lot_ids else None,
+                        "stock_code": code
+                    }
+
+            if w_sl is not None or w_tp is not None:
+                return {
+                    "action": "SET_WARNING_PRICE",
+                    "warning_sl_price": w_sl,
+                    "warning_tp_price": w_tp,
+                    "lot_id": target_lot_ids[0] if target_lot_ids else None,
+                    "stock_code": code
+                }
+
+    if "預警" in clean_text and any(k in clean_text for k in ["改", "設", "調", "為", "%", "趴"]):
+        warn_match = re.search(r'(\d+(?:\.\d+)?|[一二兩三四五六七八九十])\s*(?:%|趴)?', clean_text)
+        if warn_match:
+            raw_v = warn_match.group(1)
+            pct_val = float(raw_v) if not raw_v in CN_NUM_MAP else float(CN_NUM_MAP[raw_v])
+            is_global = any(k in clean_text for k in ["全部", "所有", "通通", "都"]) or (not target_lot_ids and not code)
+            return {
+                "action": "SET_WARNING_BUFFER",
+                "buffer_percent": pct_val,
+                "lot_id": target_lot_ids[0] if target_lot_ids else None,
+                "stock_code": code,
+                "is_global": is_global
+            }
+
+    qty = 1
+    qty_match = re.search(r'(\d+|[一二兩三四五六七八九十])\s*張', temp_text)
+    if qty_match:
+        q_val = qty_match.group(1)
+        qty = int(q_val) if q_val.isdigit() else CN_NUM_MAP.get(q_val, 1)
+
+    if target_lot_ids and is_delete:
+        return {"action": "DELETE_LOT", "lot_ids": target_lot_ids}
+
+    # 嚴格獨立解析個別設定修改（避免停利、停損、移動停利互相干擾）
+    if is_modify or any(k in clean_text for k in ["停利", "停損", "移動停利"]):
+        is_global = any(k in clean_text for k in ["全部", "所有", "預設", "通通", "所有標的"])
+        
+        # 獨立抓取移動停利
+        ts_match = re.search(r'移動停利.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(?:%|趴)?', clean_text)
+        new_ts = float(ts_match.group(1)) if ts_match else None
+
+        # 獨立抓取停損（支援 3趴 或 223元）
+        sl_match = re.search(r'停損.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(%|趴|元)?', clean_text)
+        new_sl_val = None
+        new_sl_is_pct = False
+        if sl_match and "停損" in clean_text and "移動" not in clean_text.split("停損")[0]:
+            new_sl_val = float(sl_match.group(1))
+            unit = sl_match.group(2)
+            if unit in ['%', '趴'] or ('%' not in clean_text and '趴' not in clean_text and '元' not in clean_text and new_sl_val < 50):
+                new_sl_is_pct = True
+
+        # 獨立抓取停利（支援 12% 或 250元）
+        tp_match = re.search(r'停利.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(%|趴|元)?', clean_text)
+        new_tp_val = None
+        new_tp_is_pct = False
+        if tp_match and "停利" in clean_text and "移動" not in clean_text.split("停利")[0]:
+            new_tp_val = float(tp_match.group(1))
+            unit = tp_match.group(2)
+            if unit in ['%', '趴'] or ('%' not in clean_text and '趴' not in clean_text and '元' not in clean_text and new_tp_val < 100):
+                new_tp_is_pct = True
+
+        if is_global and (new_sl_val is not None or new_tp_val is not None or new_ts is not None):
+            return {
+                "action": "UPDATE_GLOBAL_SETTINGS_EXT",
+                "new_sl": new_sl_val if "停損" in clean_text else None,
+                "new_tp": new_tp_val if "停利" in clean_text else None,
+                "new_tp_is_pct": new_tp_is_pct,
+                "new_ts": new_ts,
+                "raw_text": clean_text
+            }
+
+        if new_sl_val is not None or new_tp_val is not None or new_ts is not None:
+            return {
+                "action": "UPDATE_SETTINGS",
+                "is_global": is_global,
+                "lot_id": target_lot_ids[0] if target_lot_ids else None,
+                "stock_code": code,
+                "new_sl_val": new_sl_val,
+                "new_sl_is_pct": new_sl_is_pct,
+                "new_tp_val": new_tp_val,
+                "new_tp_is_pct": new_tp_is_pct,
+                "new_ts_percent": new_ts
+            }
+
+    price = None
+    price_match = re.search(r'(?:價格|為|賣|買|成本)?\s*(\d+(?:\.\d+)?)\s*元?', clean_text)
+    if price_match:
+        try:
+            val = float(price_match.group(1))
+            if int(val) not in target_lot_ids and (not code or str(int(val)) != code):
+                price = val
+        except ValueError:
+            pass
+
+    if not price:
+        nums = re.findall(r'(\d+(?:\.\d+)?)', clean_text)
+        candidates = [float(n) for n in nums if n != code and int(float(n)) not in target_lot_ids]
+        if candidates:
+            price = candidates[-1]
+
+    if target_lot_ids and is_sell:
+        return {"action": "SELL_MULTI_LOTS", "lot_ids": target_lot_ids, "sell_price": price, "quantity": qty}
+
+    if code and not name:
+        _, name = get_stock_info(code)
+
+    if code and is_sell:
+        return {"action": "SELL_LOT", "stock_code": code, "stock_name": name, "sell_price": price, "quantity": qty}
+
+    if code and (is_buy or price is not None):
+        return {
+            "action": "ADD_LOT",
+            "stock_code": code,
+            "stock_name": name,
+            "buy_price": price,
+            "quantity": qty,
+            "stop_loss_percent": DEFAULT_STOP_LOSS_PERCENT,
+            "take_profit_percent": DEFAULT_TAKE_PROFIT_PERCENT,
+            "trailing_stop_percent": DEFAULT_TRAILING_STOP_PERCENT,
+            "warning_buffer_percent": DEFAULT_WARNING_BUFFER_PERCENT
+        }
+
+    return ask_gemini_fallback(user_text)
+
+def handle_update_global_settings_ext(data: dict):
+    global DEFAULT_STOP_LOSS_PERCENT, DEFAULT_TAKE_PROFIT_PERCENT, DEFAULT_TRAILING_STOP_PERCENT
+    new_sl = data.get("new_sl")
+    new_tp = data.get("new_tp")
+    new_tp_is_pct = data.get("new_tp_is_pct", False)
+    new_ts = data.get("new_ts")
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            if new_sl is not None and "停損" in data.get("raw_text", ""):
+                DEFAULT_STOP_LOSS_PERCENT = new_sl
+                cur.execute("""
+                    UPDATE position_lots 
+                    SET stop_loss_percent = %s, 
+                        stop_loss_price = ROUND(buy_price * (1 - %s / 100.0), 2)
+                    WHERE monitoring_status = 'MONITORING';
+                """, (new_sl, new_sl))
+                row_count = cur.rowcount
+                conn.commit()
+                cur.close()
+                send_telegram(
+                    f"⚙️ 【全域停損防線更新成功】\n\n• 新全域預設停損：-{new_sl:.1f}%\n• 已同步套用：共 {row_count} 筆現有庫存",
+                    reply_markup=get_show_portfolio_markup()
+                )
+                return
+
+            elif new_tp is not None and "停利" in data.get("raw_text", ""):
+                if new_tp_is_pct:
+                    DEFAULT_TAKE_PROFIT_PERCENT = new_tp
+                    cur.execute("""
+                        UPDATE position_lots 
+                        SET take_profit_percent = %s, 
+                            take_profit_price = ROUND(buy_price * (1 + %s / 100.0), 2)
+                        WHERE monitoring_status = 'MONITORING';
+                    """, (new_tp, new_tp))
+                else:
+                    cur.execute("""
+                        UPDATE position_lots 
+                        SET take_profit_price = %s,
+                            take_profit_percent = ROUND(((%s - buy_price) / buy_price) * 100, 2)
+                        WHERE monitoring_status = 'MONITORING';
+                    """, (new_tp, new_tp))
+                row_count = cur.rowcount
+                conn.commit()
+                cur.close()
+                send_telegram(
+                    f"⚙️ 【全域停利目標更新成功】\n\n• 新全域預設停利：+{new_tp:.1f}%\n• 已同步套用：共 {row_count} 筆現有庫存",
+                    reply_markup=get_show_portfolio_markup()
+                )
+                return
+
+            elif new_ts is not None and "移動停利" in data.get("raw_text", ""):
+                DEFAULT_TRAILING_STOP_PERCENT = new_ts
+                cur.execute("""
+                    UPDATE position_lots 
+                    SET trailing_stop_percent = %s 
+                    WHERE monitoring_status = 'MONITORING';
+                """, (new_ts,))
+                row_count = cur.rowcount
+                conn.commit()
+                cur.close()
+                send_telegram(
+                    f"⚙️ 【全域移動停利更新成功】\n\n• 新全域移動停利：{new_ts:.1f}%\n• 已同步套用：共 {row_count} 筆現有庫存",
+                    reply_markup=get_show_portfolio_markup()
+                )
+                return
+
+        send_telegram("⚠️ 未能明確辨識要更新的全域設定數值。")
+    except Exception as e:
+        send_telegram(f"❌ 更新全域設定失敗：{e}")
+
+def handle_set_warning_price(data: dict):
+    lot_id = data.get("lot_id")
+    code = data.get("stock_code")
+    w_sl = data.get("warning_sl_price")
+    w_tp = data.get("warning_tp_price")
+    gen_p = data.get("general_price")
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            if lot_id:
+                cur.execute("SELECT lot_id, stock_code, stock_name, buy_price FROM position_lots WHERE lot_id = %s AND monitoring_status = 'MONITORING';", (lot_id,))
+            elif code:
+                cur.execute("SELECT lot_id, stock_code, stock_name, buy_price FROM position_lots WHERE stock_code = %s AND monitoring_status = 'MONITORING' ORDER BY lot_id DESC LIMIT 1;", (code,))
+            else:
+                send_telegram("⚠️ 請指明要設定預警價格的持倉編號或股票。")
+                cur.close()
+                return
+
+            row = cur.fetchone()
+            if not row:
+                send_telegram("⚠️ 找不到監控中的對應持倉資料。")
+                cur.close()
+                return
+
+            t_lot_id, t_code, _, buy_p = row
+            _, t_name = get_stock_info(t_code)
+            buy_val = float(buy_p)
+
+            if gen_p is not None and w_sl is None and w_tp is None:
+                if float(gen_p) < buy_val:
+                    w_sl = float(gen_p)
+                else:
+                    w_tp = float(gen_p)
+
+            update_fields = []
+            params = []
+            summary_txt = []
+
+            if w_sl is not None:
+                update_fields.append("warning_sl_price = %s")
+                params.append(w_sl)
+                summary_txt.append(f"• 停損預警價格：跌至 {w_sl:.1f} 元提醒")
+
+            if w_tp is not None:
+                update_fields.append("warning_tp_price = %s")
+                params.append(w_tp)
+                summary_txt.append(f"• 停利預警價格：漲至 {w_tp:.1f} 元提醒")
+
+            if not update_fields:
+                send_telegram("⚠️ 未能判斷具體的預警價格，請重新輸入。")
+                cur.close()
+                return
+
+            params.append(t_lot_id)
+            cur.execute(f"UPDATE position_lots SET {', '.join(update_fields)} WHERE lot_id = %s;", tuple(params))
+            conn.commit()
+            cur.close()
+
+        msg = f"🔔 【指定預警價格設定成功】\n\n• 庫存編號：【第 {t_lot_id} 筆】\n• 標的：{t_name} ({t_code})\n" + "\n".join(summary_txt)
+        send_telegram(msg, reply_markup=get_show_portfolio_markup())
+
+    except Exception as e:
+        send_telegram(f"❌ 設定預警價格失敗：{e}")
+
+def handle_set_warning_buffer(data: dict):
+    global DEFAULT_WARNING_BUFFER_PERCENT
+    val = data.get("buffer_percent")
+    is_global = data.get("is_global", False)
+    lot_id = data.get("lot_id")
+    code = data.get("stock_code")
+
+    if val is None or float(val) <= 0:
+        send_telegram("⚠️ 預警數值不正確，請重新輸入。")
+        return
+
+    new_wb = float(val)
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            if is_global or (not lot_id and not code):
+                DEFAULT_WARNING_BUFFER_PERCENT = new_wb
+                cur.execute("""
+                    UPDATE position_lots 
+                    SET warning_buffer_percent = %s 
+                    WHERE monitoring_status = 'MONITORING';
+                """, (DEFAULT_WARNING_BUFFER_PERCENT,))
+                row_count = cur.rowcount
+                conn.commit()
+                cur.close()
+
+                send_telegram(
+                    f"🔔 【全域預警緩衝區間更新成功】\n\n• 全域預警門檻：距離防線／目標 {DEFAULT_WARNING_BUFFER_PERCENT:.1f}%\n• 已同步套用：共 {row_count} 筆監控中庫存",
+                    reply_markup=get_show_portfolio_markup()
+                )
+                return
+
+            if lot_id:
+                cur.execute("SELECT lot_id, stock_code, stock_name FROM position_lots WHERE lot_id = %s AND monitoring_status = 'MONITORING';", (lot_id,))
+            else:
+                cur.execute("SELECT lot_id, stock_code, stock_name FROM position_lots WHERE stock_code = %s AND monitoring_status = 'MONITORING' ORDER BY lot_id DESC LIMIT 1;", (code,))
+
+            row = cur.fetchone()
+            if not row:
+                send_telegram("⚠️ 找不到監控中的對應持倉資料。")
+                cur.close()
+                return
+
+            t_lot_id, t_code, _ = row
+            _, t_name = get_stock_info(t_code)
+            cur.execute("UPDATE position_lots SET warning_buffer_percent = %s, warning_sl_price = NULL, warning_tp_price = NULL WHERE lot_id = %s;", (new_wb, t_lot_id))
+            conn.commit()
+            cur.close()
+
+        send_telegram(
+            f"🔔 【持倉預警設定更新成功】\n\n• 庫存編號：【第 {t_lot_id} 筆】\n• 標的：{t_name} ({t_code})\n• 個別預警門檻：距離防線／目標 {new_wb:.1f}%",
+            reply_markup=get_show_portfolio_markup()
+        )
+
+    except Exception as e:
+        send_telegram(f"❌ 更新預警門檻失敗：{e}")
+
+def handle_delete_lot(data: dict):
+    lot_ids = data.get("lot_ids", [])
+    if not lot_ids:
+        send_telegram("⚠️ 未指明要刪除哪一筆。")
+        return
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            deleted_items = []
+            for lot_id in lot_ids:
+                cur.execute("SELECT stock_code, stock_name, quantity, buy_price FROM position_lots WHERE lot_id = %s;", (lot_id,))
+                row = cur.fetchone()
+                if not row:
+                    deleted_items.append(f"• 【第 {lot_id} 筆】⚠️ 找不到此批次資料")
+                    continue
+
+                code, _, cur_qty, buy_p = row
+                _, name = get_stock_info(code)
+                cur.execute("UPDATE position_lots SET monitoring_status = 'DELETED', quantity = 0 WHERE lot_id = %s;", (lot_id,))
+                
+                cur.execute("""
+                    INSERT INTO trade_history (lot_id, stock_code, stock_name, action_type, quantity, price, realized_pnl, realized_pnl_pct, exit_reason)
+                    VALUES (%s, %s, %s, 'DELETED', %s, %s, 0, 0, '作廢移除');
+                """, (lot_id, code, name, cur_qty, float(buy_p)))
+
+                deleted_items.append(f"• 【第 {lot_id} 筆】{name} ({code}) {cur_qty}張（已作廢移除）")
+
+            conn.commit()
+            cur.close()
+
+        msg = f"🗑 【持倉資料作廢／刪除成功】\n\n" + "\n".join(deleted_items)
+        send_telegram(msg, reply_markup=get_show_portfolio_markup())
+
+    except Exception as e:
+        send_telegram(f"❌ 刪除持倉失敗：{e}")
+
+def handle_update_settings(data: dict):
+    global DEFAULT_TRAILING_STOP_PERCENT
+    is_global = data.get("is_global", False)
+    lot_id = data.get("lot_id")
+    code = data.get("stock_code")
+    new_tp_val = data.get("new_tp_val")
+    new_tp_is_pct = data.get("new_tp_is_pct", False)
+    new_sl_val = data.get("new_sl_val")
+    new_sl_is_pct = data.get("new_sl_is_pct", False)
+    new_ts = data.get("new_ts_percent")
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            if is_global:
+                if new_ts is not None:
+                    DEFAULT_TRAILING_STOP_PERCENT = float(new_ts)
+                    cur.execute("UPDATE position_lots SET trailing_stop_percent = %s WHERE monitoring_status = 'MONITORING';", (DEFAULT_TRAILING_STOP_PERCENT,))
+                    row_count = cur.rowcount
+                    conn.commit()
+                    cur.close()
+                    send_telegram(
+                        f"⚙️ 【全域移動停利設定更新成功】\n\n• 全域移動停利：{DEFAULT_TRAILING_STOP_PERCENT:.1f}%\n• 已同步套用：共 {row_count} 筆監控中庫存",
+                        reply_markup=get_show_portfolio_markup()
+                    )
+                    return
+                else:
+                    send_telegram("⚠️ 請指明要修改的全域參數。")
+                    cur.close()
+                    return
+
+            if lot_id:
+                cur.execute("""
+                    SELECT lot_id, stock_code, stock_name, buy_price, stop_loss_price, take_profit_price, trailing_stop_percent, quantity 
+                    FROM position_lots 
+                    WHERE lot_id = %s AND monitoring_status = 'MONITORING';
+                """, (lot_id,))
+            elif code:
+                cur.execute("""
+                    SELECT lot_id, stock_code, stock_name, buy_price, stop_loss_price, take_profit_price, trailing_stop_percent, quantity 
+                    FROM position_lots 
+                    WHERE stock_code = %s AND monitoring_status = 'MONITORING'
+                    ORDER BY lot_id DESC LIMIT 1;
+                """, (code,))
+            else:
+                send_telegram("⚠️ 請指明要修改哪一筆或哪檔標的。")
+                return
+
+            row = cur.fetchone()
+            if not row:
+                send_telegram("⚠️ 找不到監控中的對應持倉資料。")
+                cur.close()
+                return
+
+            t_lot_id, t_code, _, buy_p, cur_sl, cur_tp, cur_ts, cur_qty = row
+            _, t_name = get_stock_info(t_code)
+            buy_val = float(buy_p)
+            final_sl = float(cur_sl)
+            final_tp = float(cur_tp)
+            final_ts = float(cur_ts) if cur_ts else DEFAULT_TRAILING_STOP_PERCENT
+
+            sl_tag = ""
+            tp_tag = ""
+            ts_tag = ""
+
+            update_sql_parts = []
+            update_params = []
+
+            if new_tp_val is not None:
+                if new_tp_is_pct:
+                    tp_pct = new_tp_val
+                    final_tp = round(buy_val * (1 + tp_pct / 100.0), 2)
+                else:
+                    final_tp = float(new_tp_val)
+                    tp_pct = abs(((final_tp - buy_val) / buy_val) * 100)
+                update_sql_parts.append("take_profit_price = %s, take_profit_percent = %s")
+                update_params.extend([final_tp, tp_pct])
+                tp_tag = " （本次更新）"
+
+            if new_sl_val is not None:
+                if new_sl_is_pct:
+                    sl_pct = new_sl_val
+                    final_sl = round(buy_val * (1 - sl_pct / 100.0), 2)
+                else:
+                    final_sl = float(new_sl_val)
+                    sl_pct = abs(((buy_val - final_sl) / buy_val) * 100)
+                update_sql_parts.append("stop_loss_price = %s, stop_loss_percent = %s")
+                update_params.extend([final_sl, sl_pct])
+                sl_tag = " （本次更新）"
+
+            if new_ts is not None:
+                final_ts = float(new_ts)
+                update_sql_parts.append("trailing_stop_percent = %s")
+                update_params.append(final_ts)
+                ts_tag = " （本次更新）"
+
+            if update_sql_parts:
+                update_params.append(t_lot_id)
+                cur.execute(f"UPDATE position_lots SET {', '.join(update_sql_parts)} WHERE lot_id = %s;", tuple(update_params))
+                conn.commit()
+
+            cur.close()
+
+        cur_sl_pct = abs(((buy_val - final_sl) / buy_val) * 100)
+        cur_tp_pct = abs(((final_tp - buy_val) / buy_val) * 100)
+
+        msg = (
+            f"⚙️ 【持倉風控設定更新成功】\n\n"
+            f"• 庫存編號：【第 {t_lot_id} 筆】\n"
+            f"• 標的：{t_name} ({t_code})\n"
+            f"• 買入成本：{buy_val:.1f} 元 ({cur_qty} 張)\n"
+            f"• 停損防線：{final_sl:.1f} 元 (-{cur_sl_pct:.1f}%){sl_tag}\n"
+            f"• 停利目標：{final_tp:.1f} 元 (+{cur_tp_pct:.1f}%){tp_tag}\n"
+            f"• 移動停利：{final_ts:.1f}%{ts_tag}"
+        )
+        send_telegram(msg, reply_markup=get_show_portfolio_markup())
+
+    except Exception as e:
+        send_telegram(f"❌ 更新設定失敗：{e}")
+
+def handle_sell_multi_lots(data: dict):
+    lot_ids = data.get("lot_ids", [])
+    custom_sell_price = data.get("sell_price")
+    needed_qty = int(data.get("quantity") or 1)
+
+    if not lot_ids:
+        send_telegram("⚠️ 未指定任何持倉批次編號。")
+        return
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            sold_details = []
+            for lot_id in lot_ids:
+                cur.execute("SELECT stock_code, stock_name, buy_price, quantity, monitoring_status FROM position_lots WHERE lot_id = %s;", (lot_id,))
+                row = cur.fetchone()
+                if not row:
+                    sold_details.append(f"• 【第 {lot_id} 筆】⚠️ 找不到此批次資料")
+                    continue
+
+                code, _, buy_price, cur_qty, status = row
+                _, name = get_stock_info(code)
+                if status == 'CLOSED':
+                    sold_details.append(f"• 【第 {lot_id} 筆】{name}：已平倉結案，無法重複賣出")
+                    continue
+
+                sell_price = custom_sell_price
+                if not sell_price:
+                    _, market_p, _, _ = get_market_quote(code)
+                    sell_price = market_p
+
+                if not sell_price:
+                    sold_details.append(f"• 【第 {lot_id} 筆】{name} ({code})：無法取得行情，請手動指定賣出價格")
+                    continue
+
+                sell_price = float(sell_price)
+                buy_p = float(buy_price)
+
+                if cur_qty <= needed_qty:
+                    actual_sold = cur_qty
+                    rem_qty = 0
+                    action_type = 'FULL_SELL'
+                    cur.execute("UPDATE position_lots SET monitoring_status = 'CLOSED', quantity = 0 WHERE lot_id = %s;", (lot_id,))
+                else:
+                    actual_sold = needed_qty
+                    rem_qty = cur_qty - needed_qty
+                    action_type = 'PARTIAL_SELL'
+                    cur.execute("UPDATE position_lots SET quantity = %s WHERE lot_id = %s;", (rem_qty, lot_id))
+
+                diff_per_share = sell_price - buy_p
+                pct = (diff_per_share / buy_p) * 100
+                total_pnl = diff_per_share * actual_sold * 1000
+                sign = "+" if total_pnl >= 0 else ""
+
+                cur.execute("""
+                    INSERT INTO trade_history (lot_id, stock_code, stock_name, action_type, quantity, price, realized_pnl, realized_pnl_pct, exit_reason)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '手動平倉');
+                """, (lot_id, code, name, action_type, actual_sold, sell_price, total_pnl, pct))
+
+                rem_status_txt = f"剩餘：{rem_qty} 張" if rem_qty > 0 else "已全數出場"
+                sold_details.append(
+                    f"• 【第 {lot_id} 筆】{name} ({code})\n"
+                    f"  交易動作：{'部分平倉' if action_type == 'PARTIAL_SELL' else '完全平倉'} (賣出 {actual_sold} 張)\n"
+                    f"  剩餘庫存：{rem_status_txt}監控中\n"
+                    f"  買入成本：{buy_p:.1f} 元 ➔ 出場價格：{sell_price:.1f} 元\n"
+                    f"  實現損益：{sign}{total_pnl:,.0f} 元 ({sign}{pct:.2f}%)"
+                )
+
+            conn.commit()
+            cur.close()
+
+        msg = f"📤 【持倉平倉結算完成】\n\n" + "\n\n".join(sold_details)
+        send_telegram(msg, reply_markup=get_show_portfolio_markup())
+
+    except Exception as e:
+        send_telegram(f"❌ 指定平倉失敗：{e}")
+
+def handle_sell_lot(data: dict):
+    code = data.get("stock_code")
+    sell_price = data.get("sell_price")
+    needed_qty = int(data.get("quantity") or 1)
+
+    if not code:
+        send_telegram("⚠️ 未能判斷賣出標的。")
+        return
+
+    if not sell_price:
+        _, market_p, _, _ = get_market_quote(code)
+        sell_price = market_p
+
+    if not sell_price:
+        send_telegram(f"⚠️ 無法取得 {code} 行情，請主動輸入賣出金額。")
+        return
+
+    sell_price = float(sell_price)
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT lot_id, stock_name, buy_price, quantity FROM position_lots WHERE stock_code = %s AND monitoring_status = 'MONITORING' ORDER BY lot_id ASC;", (code,))
+            rows = cur.fetchall()
+
+            if not rows:
+                send_telegram(f"⚠️ 庫存中無監控中的 {code} 持倉可平倉。")
+                cur.close()
+                return
+
+            total_available = sum(r[3] for r in rows)
+            if total_available < needed_qty:
+                send_telegram(f"⚠️ 庫存不足！{code} 目前僅剩 {total_available} 張。")
+                cur.close()
+                return
+
+            remaining_to_sell = needed_qty
+            sold_summary = []
+
+            for r in rows:
+                if remaining_to_sell <= 0:
+                    break
+                lot_id, _, buy_price, cur_qty = r
+                _, name = get_stock_info(code)
+                buy_p = float(buy_price)
+
+                if cur_qty <= remaining_to_sell:
+                    deduct = cur_qty
+                    rem_qty = 0
+                    action_type = 'FULL_SELL'
+                    cur.execute("UPDATE position_lots SET monitoring_status = 'CLOSED', quantity = 0 WHERE lot_id = %s;", (lot_id,))
+                    remaining_to_sell -= deduct
+                else:
+                    deduct = remaining_to_sell
+                    rem_qty = cur_qty - deduct
+                    action_type = 'PARTIAL_SELL'
+                    cur.execute("UPDATE position_lots SET quantity = %s WHERE lot_id = %s;", (rem_qty, lot_id))
+                    remaining_to_sell = 0
+
+                diff_per_share = sell_price - buy_p
+                pct = (diff_per_share / buy_p) * 100
+                total_pnl = diff_per_share * deduct * 1000
+                sign = "+" if total_pnl >= 0 else ""
+
+                cur.execute("""
+                    INSERT INTO trade_history (lot_id, stock_code, stock_name, action_type, quantity, price, realized_pnl, realized_pnl_pct, exit_reason)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '手動平倉');
+                """, (lot_id, code, name, action_type, deduct, sell_price, total_pnl, pct))
+
+                rem_status_txt = f"剩餘：{rem_qty} 張" if rem_qty > 0 else "已全數出場"
+                sold_summary.append(
+                    f"• 【第 {lot_id} 筆】{name}：賣出 {deduct} 張 ({rem_status_txt})\n"
+                    f"  買入成本：{buy_p:.1f} 元 ➔ 出場價格：{sell_price:.1f} 元\n"
+                    f"  實現損益：{sign}{total_pnl:,.0f} 元 ({sign}{pct:.2f}%)"
+                )
+
+            conn.commit()
+            cur.close()
+
+        msg = f"📤 【持倉平倉結算完成（共賣出 {needed_qty} 張）】\n\n" + "\n\n".join(sold_summary)
+        send_telegram(msg, reply_markup=get_show_portfolio_markup())
+
+    except Exception as e:
+        send_telegram(f"❌ 沖銷失敗：{e}")
+
+def handle_add_lot(data: dict):
+    code = data.get("stock_code")
+    _, name = get_stock_info(code)
+    raw_price = data.get("buy_price")
+    
+    if not code or raw_price is None:
+        send_telegram("⚠️ 未能確認有效的代號或買進價格，請重新輸入。")
+        return
+
+    buy_price = float(raw_price)
+    qty = int(data.get("quantity") or 1)
+    
+    sl_pct = float(DEFAULT_STOP_LOSS_PERCENT)
+    tp_pct = float(DEFAULT_TAKE_PROFIT_PERCENT)
+    ts_pct = float(DEFAULT_TRAILING_STOP_PERCENT)
+    wb_pct = float(DEFAULT_WARNING_BUFFER_PERCENT)
+    ts_act_pct = DEFAULT_TRAILING_ACTIVATION_PERCENT
+
+    sl_price = round(buy_price * (1 - sl_pct / 100), 2)
+    tp_price = round(buy_price * (1 + tp_pct / 100), 2)
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO position_lots 
+                (stock_code, stock_name, buy_date, buy_price, quantity, 
+                 take_profit_percent, stop_loss_percent, trailing_stop_percent, 
+                 take_profit_price, stop_loss_price, highest_price, monitoring_status, warning_buffer_percent,
+                 ts_activation_percent)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'MONITORING', %s, %s)
+                RETURNING lot_id;
+            """, (code, name, date.today(), buy_price, qty, tp_pct, sl_pct, ts_pct, tp_price, sl_price, buy_price, wb_pct, ts_act_pct))
+            lot_id = cur.fetchone()[0]
+
+            cur.execute("""
+                INSERT INTO trade_history (lot_id, stock_code, stock_name, action_type, quantity, price, realized_pnl, realized_pnl_pct, exit_reason)
+                VALUES (%s, %s, %s, 'BUY', %s, %s, 0, 0, '建倉買進');
+            """, (lot_id, code, name, qty, buy_price))
+
+            conn.commit()
+            cur.close()
+
+        msg = (
+            f"✅ 【持倉建立成功】\n\n"
+            f"• 庫存編號：【第 {lot_id} 筆】\n"
+            f"• 標的：{name} ({code})\n"
+            f"• 買入成本：{buy_price:.1f} 元 ({qty} 張)\n"
+            f"• 停損防線：{sl_price:.1f} 元 (-{sl_pct:.1f}%)\n"
+            f"• 停利目標：{tp_price:.1f} 元 (+{tp_pct:.1f}%)\n"
+            f"• 移動停利：{ts_pct:.1f}%（獲利達 +{ts_act_pct:.1f}% 啟動）\n"
+            f"• 預警通知：{wb_pct:.1f}%"
+        )
+        send_telegram(msg, reply_markup=get_show_portfolio_markup())
+    except Exception as e:
+        send_telegram(f"❌ 寫入失敗：{e}")
+
+def handle_query(filter_keyword: str = None, sort_by_profit: bool = False):
+    send_telegram(get_portfolio_summary_text(filter_keyword=filter_keyword, sort_by_profit=sort_by_profit))
+
+def handle_get_price(data: dict):
+    raw_code = data.get("stock_code")
+    code, name = get_stock_info(raw_code)
+
+    if not code:
+        send_telegram("⚠️ 未能判斷查詢標的。")
+        return
+
+    _, price, _, _ = get_market_quote(code)
+    if price is None:
+        send_telegram(f"❌ 市場查無 {name} ({code}) 行情。")
+    else:
+        send_telegram(f"📊 【市場即時行情】\n\n• 標的：{name} ({code})\n• 最新成交價：{price:.2f} 元")
+
+def clear_test_data():
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM trade_history;")
+            cur.execute("DELETE FROM notification_records;")
+            cur.execute("DELETE FROM daily_reports;")
+            cur.execute("DELETE FROM position_lots;")
+            conn.commit()
+            cur.close()
+        send_telegram("🧹 測試資料庫已全數清空！")
+    except Exception as e:
+        send_telegram(f"❌ 清除失敗：{e}")
+
+def send_daily_market_report():
+    today = date.today()
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM daily_reports WHERE report_date = %s;", (today,))
+            if cur.fetchone():
+                cur.close()
+                return
+
+            cur.execute("""
+                SELECT event_type, COUNT(*) 
+                FROM notification_records 
+                WHERE trade_date = %s 
+                GROUP BY event_type;
+            """, (today,))
+            ev_counts = dict(cur.fetchall())
+
+            sl_cnt = ev_counts.get('STOP_LOSS', 0)
+            tp_cnt = ev_counts.get('TAKE_PROFIT', 0)
+            ts_cnt = ev_counts.get('TRAILING_STOP', 0)
+            warn_cnt = ev_counts.get('APPROACHING_STOP_LOSS', 0) + ev_counts.get('APPROACHING_TAKE_PROFIT', 0)
+
+            cur.execute("INSERT INTO daily_reports (report_date) VALUES (%s);", (today,))
+            conn.commit()
+            cur.close()
+
+        report_msg = (
+            f"📊 【{today.strftime('%Y-%m-%d')} 今日風控觸發統計】\n\n"
+            f"• 停損觸發：{sl_cnt} 次\n"
+            f"• 停利達標：{tp_cnt} 次\n"
+            f"• 移動停利：{ts_cnt} 次\n"
+            f"• 接近預警：{warn_cnt} 次\n\n"
+            f"🛡 今日盯盤結束，祝您投資順心！"
+        )
+        send_telegram(report_msg)
+        print("📢 今日風控統計日報已成功發送！")
+
+    except Exception as e:
+        print(f"❌ 統計發送失敗：{e}")
+
+def background_monitor():
+    while True:
+        if is_market_closing_time():
+            send_daily_market_report()
+
+        if not is_market_open():
+            time.sleep(120)
+            continue
+
+        try:
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT lot_id, stock_code, stock_name, buy_price, stop_loss_price, 
+                           take_profit_price, quantity, stop_loss_percent, take_profit_percent, 
+                           highest_price, trailing_stop_percent, warning_buffer_percent, 
+                           warning_sl_price, warning_tp_price, ts_activation_percent
+                    FROM position_lots 
+                    WHERE monitoring_status = 'MONITORING';
+                """)
+                lots = cur.fetchall()
+
+                for lot in lots:
+                    lot_id, code, _, buy_p, sl_p, tp_p, qty, sl_pct, tp_pct, high_p, ts_pct, wb_pct, w_sl_p, w_tp_p, ts_act_p = lot
+                    _, name = get_stock_info(code)
+                    _, cur_price, day_high, day_low = get_market_quote(code)
+                    if not cur_price:
+                        continue
+
+                    today = date.today()
+                    buy_val = float(buy_p)
+                    sl_val = float(sl_p)
+                    tp_val = float(tp_p)
+                    high_val = float(high_p) if high_p else buy_val
+                    ts_val = float(ts_pct) if ts_pct else DEFAULT_TRAILING_STOP_PERCENT
+                    wb_val = float(wb_pct) if wb_pct is not None else DEFAULT_WARNING_BUFFER_PERCENT
+                    w_sl_val = float(w_sl_p) if w_sl_p is not None else None
+                    w_tp_val = float(w_tp_p) if w_tp_p is not None else None
+                    ts_act_val = float(ts_act_p) if ts_act_p is not None else DEFAULT_TRAILING_ACTIVATION_PERCENT
+                    diff_pct = ((cur_price - buy_val) / buy_val) * 100
+
+                    if cur_price > high_val:
+                        high_val = cur_price
+                        cur.execute("UPDATE position_lots SET highest_price = %s WHERE lot_id = %s;", (high_val, lot_id))
+                        conn.commit()
+
+                    trailing_stop_price = round(high_val * (1 - ts_val / 100), 2)
+
+                    is_hit_sl = (cur_price <= sl_val)
+                    if is_hit_sl:
+                        cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'STOP_LOSS';", (lot_id, today))
+                        if not cur.fetchone():
+                            actual_trigger_p = cur_price
+                            trigger_diff_pct = ((actual_trigger_p - buy_val) / buy_val) * 100
+                            sl_alert_msg = (
+                                f"🚨 【停損出場警報！】\n\n"
+                                f"• 庫存編號：【第 {lot_id} 筆】\n"
+                                f"• 標的：{name} ({code}) ({qty} 張)\n"
+                                f"• 買入成本：{buy_val:.1f} 元\n"
+                                f"• 停損防線：{sl_val:.1f} 元 (-{abs(float(sl_pct)):.1f}%)\n"
+                                f"• 目前現價：{cur_price:.2f} 元 (觸發價: {actual_trigger_p:.2f}元, {trigger_diff_pct:.2f}%)\n\n"
+                                f"⚠️ 已跌破停損防線！請嚴守紀律果斷出場！"
+                            )
+                            send_telegram(sl_alert_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'STOP_LOSS', %s);", (lot_id, today, actual_trigger_p))
+                            conn.commit()
+                        continue
+
+                    is_hit_tp = (cur_price >= tp_val)
+                    if is_hit_tp:
+                        cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'TAKE_PROFIT';", (lot_id, today))
+                        if not cur.fetchone():
+                            actual_trigger_p = cur_price
+                            trigger_diff_pct = ((actual_trigger_p - buy_val) / buy_val) * 100
+                            tp_alert_msg = (
+                                f"🎉 【停利達標警報！】\n\n"
+                                f"• 庫存編號：【第 {lot_id} 筆】\n"
+                                f"• 標的：{name} ({code}) ({qty} 張)\n"
+                                f"• 買入成本：{buy_val:.1f} 元\n"
+                                f"• 停利目標：{tp_val:.1f} 元 (+{abs(float(tp_pct)):.1f}%)\n"
+                                f"• 目前現價：{cur_price:.2f} 元 (達標價: {actual_trigger_p:.2f}元, +{trigger_diff_pct:.2f}%)\n\n"
+                                f"💰 獲利達標！可考慮分批獲利入袋！"
+                            )
+                            send_telegram(tp_alert_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'TAKE_PROFIT', %s);", (lot_id, today, actual_trigger_p))
+                            conn.commit()
+                        continue
+
+                    activation_price = buy_val * (1 + ts_act_val / 100)
+                    has_reached_activation = high_val >= activation_price
+
+                    if has_reached_activation and cur_price <= trailing_stop_price:
+                        cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'TRAILING_STOP';", (lot_id, today))
+                        if not cur.fetchone():
+                            ts_alert_msg = (
+                                f"🚨 【移動停利出場警報！】\n\n"
+                                f"• 庫存編號：【第 {lot_id} 筆】\n"
+                                f"• 標的：{name} ({code}) ({qty} 張)\n"
+                                f"• 買入成本：{buy_val:.1f} 元\n"
+                                f"• 啟動條件：曾達獲利 +{ts_act_val:.1f}% 門檻（最高 {high_val:.1f} 元）\n"
+                                f"• 移動防線：{trailing_stop_price:.1f} 元 (自高點回檔 -{ts_val:.1f}%)\n"
+                                f"• 目前現價：{cur_price:.2f} 元 ({diff_pct:.2f}%)\n\n"
+                                f"⚠️ 自最高點回檔觸發移動停利！請獲利入袋！"
+                            )
+                            send_telegram(ts_alert_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'TRAILING_STOP', %s);", (lot_id, today, cur_price))
+                            conn.commit()
+                        continue
+
+                    is_warn_sl = False
+                    if w_sl_val is not None:
+                        is_warn_sl = (cur_price <= w_sl_val and cur_price > sl_val)
+                    else:
+                        dist_to_sl_pct = ((cur_price - sl_val) / buy_val) * 100
+                        is_warn_sl = (0 < dist_to_sl_pct <= wb_val)
+
+                    is_warn_tp = False
+                    if w_tp_val is not None:
+                        is_warn_tp = (cur_price >= w_tp_val and cur_price < tp_val)
+                    else:
+                        dist_to_tp_pct = ((tp_val - cur_price) / buy_val) * 100
+                        is_warn_tp = (0 < dist_to_tp_pct <= wb_val)
+
+                    if is_warn_sl:
+                        cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'APPROACHING_STOP_LOSS';", (lot_id, today))
+                        if not cur.fetchone():
+                            warn_sl_msg = (
+                                f"⚠️ 【接近停損防線預警】\n\n"
+                                f"• 庫存編號：【第 {lot_id} 筆】\n"
+                                f"• 標的：{name} ({code}) ({qty} 張)\n"
+                                f"• 目前現價：{cur_price:.2f} 元 ({diff_pct:.2f}%)\n"
+                                f"• 停損防線：{sl_val:.1f} 元 (-{abs(float(sl_pct)):.1f}%)\n"
+                                f"• 距離防線：僅剩 {cur_price - sl_val:.2f} 元\n\n"
+                                f"⏳ 股價逼近停損，請做好出場準備。（即時預警通知）"
+                            )
+                            send_telegram(warn_sl_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'APPROACHING_STOP_LOSS', %s);", (lot_id, today, cur_price))
+                            conn.commit()
+
+                    elif is_warn_tp:
+                        cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'APPROACHING_TAKE_PROFIT';", (lot_id, today))
+                        if not cur.fetchone():
+                            warn_tp_msg = (
+                                f"🎯 【接近停利目標預警】\n\n"
+                                f"• 庫存編號：【第 {lot_id} 筆】\n"
+                                f"• 標的：{name} ({code}) ({qty} 張)\n"
+                                f"• 目前現價：{cur_price:.2f} 元 (+{diff_pct:.2f}%)\n"
+                                f"• 停利目標：{tp_val:.1f} 元 (+{abs(float(tp_pct)):.1f}%)\n"
+                                f"• 距離目標：_{tp_val - cur_price:.2f} 元\n\n"
+                                f"⏳ 股價即將達標，可留意獲利賣單。（即時預警通知）"
+                            )
+                            send_telegram(warn_tp_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'APPROACHING_TAKE_PROFIT', %s);", (lot_id, today, cur_price))
+                            conn.commit()
+
+                cur.close()
+        except Exception as e:
+            print(f"❌ 巡邏例外錯誤：{e}")
+
+        time.sleep(60)
+
+def run_bot():
+    print("🤖 周大 AI 交易管家已上線，正在檢查資料庫結構並監聽訊息...")
+    init_db_schema()
+    threading.Thread(target=background_monitor, daemon=True).start()
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    last_update_id = 0
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 0}
+            
+            resp = requests.get(url, params=params, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "result" in data and len(data["result"]) > 0:
+                    for item in data["result"]:
+                        last_update_id = item["update_id"]
+                        
+                        if "callback_query" in item:
+                            cb = item["callback_query"]
+                            cb_id = cb["id"]
+                            cb_data = cb.get("data")
+                            
+                            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id})
+                            
+                            if cb_data == "SHOW_ALL_PORTFOLIO":
+                                summary_text = get_portfolio_summary_text()
+                                send_telegram(summary_text)
+                            continue
+
+                        msg = item.get("message", {})
+                        text = msg.get("text", "").strip()
+
+                        if not text:
+                            continue
+
+                        print(f"📩 收到訊息: {text}")
+
+                        if text == "/clear_test":
+                            clear_test_data()
+                        elif text in ["/report", "日報", "風控統計"]:
+                            send_daily_market_report()
+                        elif text in ["/start", "你好", "哈囉"]:
+                            send_telegram("👋 周大您好！AI 管家已就位。可直接輸入「買進 61041 147元 1張」、「現在 61041 多少」或「查詢」。")
+                        else:
+                            parsed = extract_trade_intent(text)
+                            act = parsed.get("action")
+                            print(f"👉 動作判斷: {act}")
+
+                            if act == "QUERY_PORTFOLIO_FILTERED":
+                                handle_query(filter_keyword=parsed.get("filter_keyword"), sort_by_profit=parsed.get("sort_by_profit", False))
+                            elif act == "SET_WARNING_PRICE":
+                                handle_set_warning_price(parsed)
+                            elif act == "SET_WARNING_BUFFER":
+                                handle_set_warning_buffer(parsed)
+                            elif act == "DELETE_LOT":
+                                handle_delete_lot(parsed)
+                            elif act == "UPDATE_SETTINGS":
+                                handle_update_settings(parsed)
+                            elif act == "UPDATE_GLOBAL_SETTINGS_EXT":
+                                handle_update_global_settings_ext(parsed)
+                            elif act in ["SELL_MULTI_LOTS", "SELL_BY_LOT_ID"]:
+                                if "lot_ids" not in parsed and "lot_id" in parsed:
+                                    parsed["lot_ids"] = [parsed["lot_id"]]
+                                handle_sell_multi_lots(parsed)
+                            elif act == "GET_PRICE":
+                                handle_get_price(parsed)
+                            elif act == "ADD_LOT":
+                                handle_add_lot(parsed)
+                            elif act == "SELL_LOT":
+                                handle_sell_lot(parsed)
+                            elif act == "QUERY_PORTFOLIO":
+                                handle_query()
+                            else:
+                                send_telegram("🤖 收到訊息，如需記帳請指明標的與價格（例如：買進 61041 147元 1張）。")
+
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+if __name__ == "__main__":
+    run_bot()
