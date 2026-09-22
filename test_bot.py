@@ -5,6 +5,7 @@ import re
 import threading
 from datetime import date, datetime, time as dtime
 from contextlib import contextmanager
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import psycopg2
 from psycopg2 import pool
 import requests
@@ -22,7 +23,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FUGLE_TOKEN = os.getenv("FUGLE_TOKEN")
 
 if not all([BOT_TOKEN, CHAT_ID, DB_URL, GEMINI_API_KEY, FUGLE_TOKEN]):
-    print("⚠️ 警告：環境變數讀取不完整，請檢查 .env 檔案設定！")
+    print("⚠️ 警告：環境變數讀取不完整，請檢查設定！")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -506,15 +507,12 @@ def extract_trade_intent(user_text: str):
     if target_lot_ids and is_delete:
         return {"action": "DELETE_LOT", "lot_ids": target_lot_ids}
 
-    # 嚴格獨立解析個別設定修改（避免停利、停損、移動停利互相干擾）
     if is_modify or any(k in clean_text for k in ["停利", "停損", "移動停利"]):
         is_global = any(k in clean_text for k in ["全部", "所有", "預設", "通通", "所有標的"])
         
-        # 獨立抓取移動停利
         ts_match = re.search(r'移動停利.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(?:%|趴)?', clean_text)
         new_ts = float(ts_match.group(1)) if ts_match else None
 
-        # 獨立抓取停損（支援 3趴 或 223元）
         sl_match = re.search(r'停損.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(%|趴|元)?', clean_text)
         new_sl_val = None
         new_sl_is_pct = False
@@ -524,7 +522,6 @@ def extract_trade_intent(user_text: str):
             if unit in ['%', '趴'] or ('%' not in clean_text and '趴' not in clean_text and '元' not in clean_text and new_sl_val < 50):
                 new_sl_is_pct = True
 
-        # 獨立抓取停利（支援 12% 或 250元）
         tp_match = re.search(r'停利.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(%|趴|元)?', clean_text)
         new_tp_val = None
         new_tp_is_pct = False
@@ -1402,10 +1399,34 @@ def background_monitor():
 
         time.sleep(60)
 
+# -------------------------------------------------------------------------
+# 內建極輕量網頁伺服器（對應 Render 免費 Web Service）
+# -------------------------------------------------------------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"AI Trading Bot is running 24/7!")
+
+    def log_message(self, format, *args):
+        return
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"Web server started on port {port}")
+    server.serve_forever()
+
 def run_bot():
     print("🤖 周大 AI 交易管家已上線，正在檢查資料庫結構並監聽訊息...")
     init_db_schema()
+    
+    # 啟動背景盯盤執行緒
     threading.Thread(target=background_monitor, daemon=True).start()
+    
+    # 啟動輕量網頁伺服器執行緒（防休眠）
+    threading.Thread(target=run_web_server, daemon=True).start()
 
     headers = {"User-Agent": "Mozilla/5.0"}
     last_update_id = 0
