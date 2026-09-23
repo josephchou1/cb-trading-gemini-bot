@@ -1,5 +1,7 @@
+python-telegram-bot>=20.0
+google-genai
 psycopg2-binary
 requests
 twstock
 python-dotenv
-google-genai
+Pillow
