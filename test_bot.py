@@ -52,11 +52,6 @@ DEFAULT_TRAILING_STOP_PERCENT = 6.0
 DEFAULT_TRAILING_ACTIVATION_PERCENT = 3.0
 DEFAULT_WARNING_BUFFER_PERCENT = 1.0
 
-CN_NUM_MAP = {
-    "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, 
-    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10
-}
-
 def get_stock_info(identifier: str):
     if not identifier:
         return None, None
