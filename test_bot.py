@@ -138,32 +138,63 @@ def init_db_schema():
     except Exception as e:
         print(f"⚠️ 初始化 schema 提示：{e}")
 
+def split_telegram_text(text: str, max_chars: int = 3000):
+    """Split long plain-text messages into Telegram-safe chunks at line boundaries."""
+    text = str(text)
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > max_chars:
+            if current:
+                chunks.append(current.rstrip())
+                current = ""
+            chunks.append(line[:max_chars])
+            line = line[max_chars:]
+        if len(current) + len(line) > max_chars:
+            if current:
+                chunks.append(current.rstrip())
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current.rstrip())
+    return chunks or [""]
+
 def send_telegram(text: str, silent: bool = False, reply_markup=None, chat_id=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id or CHAT_ID,
-        "text": text,
-        "disable_notification": silent
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
     headers = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
-    for _ in range(3):
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=8)
-            if resp.status_code == 200:
+    chunks = split_telegram_text(text)
+    last_data = None
+    for index, chunk in enumerate(chunks):
+        payload = {
+            "chat_id": chat_id or CHAT_ID,
+            "text": chunk,
+            "disable_notification": silent
+        }
+        if reply_markup and index == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+
+        delivered = False
+        for _ in range(3):
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=8)
                 data = resp.json()
-                if data.get("ok"):
-                    return data
-                print(f"❌ Telegram sendMessage 失敗：{data.get('description', '未知錯誤')}")
-            else:
-                print(f"❌ Telegram sendMessage HTTP {resp.status_code}")
-        except Exception as e:
-            safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
-            print(f"❌ Telegram sendMessage 連線錯誤：{type(e).__name__}: {safe_error}")
-            time.sleep(0.5)
-    return None
+                if resp.status_code == 200 and data.get("ok"):
+                    last_data = data
+                    delivered = True
+                    break
+                description = data.get("description", "未知錯誤")
+                print(f"❌ Telegram sendMessage HTTP {resp.status_code}: {description}", flush=True)
+            except Exception as e:
+                safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
+                print(f"❌ Telegram sendMessage 連線錯誤：{type(e).__name__}: {safe_error}", flush=True)
+                time.sleep(0.5)
+        if not delivered:
+            return None
+    return last_data
 
 def get_market_quote(code: str):
     code, name = get_stock_info(code)
