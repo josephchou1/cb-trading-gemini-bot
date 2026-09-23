@@ -372,19 +372,18 @@ def clean_input_text(text: str) -> str:
 def extract_trade_intent(user_text: str):
     clean_text = clean_input_text(user_text)
     
-    prompt = """
-你是一個台灣股市 AI 交易管家助理。請分析使用者的這句話，並嚴格以純 JSON 格式回傳結果（絕對不要包含 ```json 或任何 markdown 標記，只要輸出大括號 {} 內部的 JSON）。
-
-支援的 action 類型：
-- "ADD_LOT": 買進建倉。需包含欄位: "stock_code" (4碼股票代號或5碼可轉債代號，請根據股票中文名稱自動查出正確代號，例如 臺企銀=2834, 台積電=2330, 聯發科=2454 等), "stock_name" (股票名稱), "buy_price" (買進價格，浮點數), "quantity" (張數，整數，若未寫預設為 1)
-- "SELL_LOT": 賣出/平倉。需包含欄位: "stock_code", "sell_price", "quantity"
-- "QUERY_PORTFOLIO_FILTERED": 查詢庫存。需包含欄位: "filter_keyword" (過濾關鍵字), "sort_by_profit" (布林值，是否依獲利排序)
-- "GET_PRICE": 查現價。需包含欄位: "stock_code"
-- "UPDATE_SETTINGS": 修改設定。
-- "UNKNOWN": 無法辨識。
-
-請解析這句使用者訊息：\"""" + clean_text + """"\"
-"""
+    prompt = (
+        "你是一個台灣股市 AI 交易管家助理。請分析使用者的這句話，並嚴格以純 JSON 格式回傳結果（絕對不要包含 ```json 或任何 markdown 標記，只要輸出大括號 {} 內部的 JSON）。\n\n"
+        "支援的 action 類型：\n"
+        "- \"ADD_LOT\": 買進建倉。需包含欄位: \"stock_code\" (4碼股票代號或5碼可轉債代號，請根據股票中文名稱自動查出正確代號，例如 臺企銀=2834, 台積電=2330, 聯發科=2454 等), \"stock_name\" (股票名稱), \"buy_price\" (買進價格，浮點數), \"quantity\" (張數，整數，若未寫預設為 1)\n"
+        "- \"SELL_LOT\": 賣出/平倉。需包含欄位: \"stock_code\", \"sell_price\", \"quantity\"\n"
+        "- \"QUERY_PORTFOLIO_FILTERED\": 查詢庫存。需包含欄位: \"filter_keyword\" (過濾關鍵字), \"sort_by_profit\" (布林值，是否依獲利排序)\n"
+        "- \"GET_PRICE\": 查現價。需包含欄位: \"stock_code\"\n"
+        "- \"UPDATE_SETTINGS\": 修改設定。\n"
+        "- \"UNKNOWN\": 無法辨識。\n\n"
+        f"請解析這句使用者訊息：\"{clean_text}\""
+    )
+    
     try:
         response = client.models.generate_content(
             model='gemini-3.5-flash-lite',
