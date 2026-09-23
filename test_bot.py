@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import io
+from pathlib import Path
 from datetime import date, datetime, time as dtime
 from contextlib import contextmanager
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -16,7 +17,7 @@ from google import genai
 from google.genai import types
 from PIL import Image
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -24,17 +25,25 @@ DB_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FUGLE_TOKEN = os.getenv("FUGLE_TOKEN")
 
-if not all([BOT_TOKEN, CHAT_ID, DB_URL, GEMINI_API_KEY, FUGLE_TOKEN]):
-    print("⚠️ 警告：環境變數讀取不完整，請檢查設定！")
+required_env = {
+    "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+    "TELEGRAM_CHAT_ID": CHAT_ID,
+    "DATABASE_URL": DB_URL,
+    "GEMINI_API_KEY": GEMINI_API_KEY,
+    "FUGLE_TOKEN": FUGLE_TOKEN,
+}
+missing_env = [name for name, value in required_env.items() if not value]
+if missing_env:
+    raise RuntimeError("缺少必要環境變數：" + ", ".join(missing_env))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 db_pool = None
 try:
-    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DB_URL)
+    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DB_URL, sslmode="require")
     print("✅ 資料庫連線池 (ThreadedConnectionPool) 初始化成功")
 except Exception as e:
-    print(f"❌ 資料庫連線池初始化失敗: {e}")
+    raise RuntimeError("資料庫連線池初始化失敗，請檢查 DATABASE_URL 與雲端資料庫網路設定。") from e
 
 @contextmanager
 def get_db_connection():
@@ -42,6 +51,10 @@ def get_db_connection():
     try:
         conn = db_pool.getconn()
         yield conn
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
     finally:
         if conn and db_pool:
             db_pool.putconn(conn)
@@ -140,8 +153,15 @@ def send_telegram(text: str, silent: bool = False, reply_markup=None):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=8)
             if resp.status_code == 200:
-                return resp.json()
-        except Exception:
+                data = resp.json()
+                if data.get("ok"):
+                    return data
+                print(f"❌ Telegram sendMessage 失敗：{data.get('description', '未知錯誤')}")
+            else:
+                print(f"❌ Telegram sendMessage HTTP {resp.status_code}")
+        except Exception as e:
+            safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
+            print(f"❌ Telegram sendMessage 連線錯誤：{type(e).__name__}: {safe_error}")
             time.sleep(0.5)
     return None
 
@@ -379,7 +399,14 @@ def extract_trade_intent(user_text: str):
         "- \"SELL_LOT\": 賣出/平倉。需包含欄位: \"stock_code\", \"sell_price\", \"quantity\"\n"
         "- \"QUERY_PORTFOLIO_FILTERED\": 查詢庫存。需包含欄位: \"filter_keyword\" (過濾關鍵字), \"sort_by_profit\" (布林值，是否依獲利排序)\n"
         "- \"GET_PRICE\": 查現價。需包含欄位: \"stock_code\"\n"
-        "- \"UPDATE_SETTINGS\": 修改設定。\n"
+        "- \"QUERY_PORTFOLIO\": 查詢全部監控中的庫存。\n"
+        "- \"SET_WARNING_PRICE\": 設定持倉預警價格。需包含 lot_id 或 stock_code，以及 warning_sl_price、warning_tp_price 或 general_price。\n"
+        "- \"SET_WARNING_BUFFER\": 設定預警緩衝百分比。需包含 buffer_percent，可選 lot_id、stock_code、is_global。\n"
+        "- \"DELETE_LOT\": 作廢持倉。需包含 lot_ids (整數列表)。\n"
+        "- \"SELL_MULTI_LOTS\": 按持倉編號賣出。需包含 lot_ids (整數列表)、quantity，可選 sell_price。\n"
+        "- \"SELL_BY_LOT_ID\": 按單一持倉編號賣出。需包含 lot_id、quantity，可選 sell_price。\n"
+        "- \"UPDATE_SETTINGS\": 修改指定持倉風控。需包含 lot_id 或 stock_code，以及 new_tp_val/new_tp_is_pct、new_sl_val/new_sl_is_pct 或 new_ts_percent。\n"
+        "- \"UPDATE_GLOBAL_SETTINGS_EXT\": 修改全域風控。需包含 new_sl、new_tp、new_ts，及 new_tp_is_pct (如適用) 和 raw_text。\n"
         "- \"UNKNOWN\": 無法辨識。\n\n"
         f"請解析這句使用者訊息：\"{clean_text}\""
     )
@@ -405,14 +432,14 @@ def extract_trade_intent(user_text: str):
 
 def handle_screenshot_image(photo_file_id: str):
     try:
-        file_info_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/getFile?file_id={photo_file_id}"
-        resp = requests.get(file_info_url, timeout=5).json()
+        file_info_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
+        resp = requests.get(file_info_url, params={"file_id": photo_file_id}, timeout=5).json()
         if not resp.get("ok"):
             send_telegram("❌ 無法取得圖片檔案資訊。")
             return
 
         file_path = resp["result"]["file_path"]
-        download_url = f"[https://api.telegram.org/file/bot](https://api.telegram.org/file/bot){BOT_TOKEN}/{file_path}"
+        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         
         img_resp = requests.get(download_url, timeout=10)
         image = Image.open(io.BytesIO(img_resp.content))
@@ -1289,6 +1316,26 @@ def run_web_server():
 
 def run_bot():
     print("🤖 周大 AI 交易管家已上線，正在檢查資料庫結構並監聽訊息與圖片...")
+    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    try:
+        webhook_resp = requests.get(f"{api_url}/getWebhookInfo", timeout=10)
+        webhook_data = webhook_resp.json()
+        if not webhook_data.get("ok"):
+            raise RuntimeError(f"Telegram API 錯誤：{webhook_data.get('description', 'getWebhookInfo 失敗')}")
+        if webhook_data.get("result", {}).get("url"):
+            delete_resp = requests.post(
+                f"{api_url}/deleteWebhook",
+                data={"drop_pending_updates": "false"},
+                timeout=10,
+            )
+            delete_data = delete_resp.json()
+            if not delete_data.get("ok"):
+                raise RuntimeError(f"無法關閉既有 webhook：{delete_data.get('description', '未知錯誤')}")
+            print("ℹ️ 已移除既有 Telegram webhook，改用 getUpdates 輪詢；保留尚未處理的訊息。")
+    except Exception as e:
+        safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
+        raise RuntimeError(f"Telegram 啟動檢查失敗：{type(e).__name__}: {safe_error}") from e
+
     init_db_schema()
     
     threading.Thread(target=background_monitor, daemon=True).start()
@@ -1299,7 +1346,7 @@ def run_bot():
 
     while True:
         try:
-            url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/getUpdates"
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
             params = {"offset": last_update_id + 1, "timeout": 0}
             
             resp = requests.get(url, params=params, headers=headers, timeout=5)
@@ -1314,7 +1361,7 @@ def run_bot():
                             cb_id = cb["id"]
                             cb_data = cb.get("data")
                             
-                            requests.post(f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id})
+                            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=8)
                             
                             if cb_data == "SHOW_ALL_PORTFOLIO":
                                 summary_text = get_portfolio_summary_text()
@@ -1373,9 +1420,16 @@ def run_bot():
                                 handle_query()
                             else:
                                 send_telegram("🤖 收到訊息，如需記帳請指明標的與價格（例如：買進 61041 147元 1張），或直接傳送庫存截圖。")
+            else:
+                try:
+                    telegram_error = resp.json().get("description", "")
+                except ValueError:
+                    telegram_error = ""
+                print(f"❌ Telegram getUpdates HTTP {resp.status_code}: {telegram_error}")
 
-        except Exception:
-            pass
+        except Exception as e:
+            safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
+            print(f"❌ Telegram 主迴圈錯誤：{type(e).__name__}: {safe_error}")
 
         time.sleep(1)
 
