@@ -3,6 +3,7 @@ import time
 import json
 import re
 import threading
+import io
 from datetime import date, datetime, time as dtime
 from contextlib import contextmanager
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -13,6 +14,7 @@ import twstock
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from PIL import Image
 
 load_dotenv()
 
@@ -372,227 +374,111 @@ def clean_input_text(text: str) -> str:
     t = t.replace('，', ' ').replace('。', ' ')
     return re.sub(r'\s+', ' ', t)
 
-def ask_gemini_fallback(user_text: str) -> dict:
+# ==========================================
+# 升級：全面透過 gemini-3.5-flash-lite 進行智慧意圖與代號解析
+# ==========================================
+def extract_trade_intent(user_text: str):
+    clean_text = clean_input_text(user_text)
+    
+    # 建立強大的提示詞，讓 Gemini 直接處理中文名稱對應、代號查找與參數萃取
     prompt = f"""
-分析股票交易對話，輸出純 JSON，勿加任何格式標記：
-支援 action: ADD_LOT, SELL_LOT, SELL_MULTI_LOTS, DELETE_LOT, UPDATE_SETTINGS, SET_WARNING_BUFFER, SET_WARNING_PRICE, QUERY_PORTFOLIO, GET_PRICE, UNKNOWN
-注意同音字：玉井/預景=預警, 兩趴=2%。
-用戶訊息："{user_text}"
+你是一個台灣股市 AI 交易管家助理。請分析使用者的這句話，並嚴格以純 JSON 格式回傳結果（絕對不要包含 ```json 或任何 markdown 標記，只要輸出大括號 {} 內部的 JSON）。
+
+支援的 action 類型：
+- "ADD_LOT": 買進建倉。需包含欄位: "stock_code" (4碼股票代號或5碼可轉債代號，請根據股票中文名稱自動查出正確代號，例如 臺企銀=2834, 台積電=2330, 聯發科=2454 等), "stock_name" (股票名稱), "buy_price" (買進價格，浮點數), "quantity" (張數，整數，若未寫預設為 1)
+- "SELL_LOT": 賣出/平倉。需包含欄位: "stock_code", "sell_price", "quantity"
+- "QUERY_PORTFOLIO_FILTERED": 查詢庫存。需包含欄位: "filter_keyword" (過濾關鍵字), "sort_by_profit" (布林值，是否依獲利排序)
+- "GET_PRICE": 查現價。需包含欄位: "stock_code"
+- "UPDATE_SETTINGS": 修改設定。
+- "UNKNOWN": 無法辨識。
+
+請解析這句使用者訊息："{clean_text}"
 """
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.5-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        return json.loads(response.text.strip())
-    except Exception:
+        result = json.loads(response.text.strip())
+        
+        # 如果 AI 解析出來是 ADD_LOT 但代號或價格沒抓好，做個安全補正
+        if result.get("action") == "ADD_LOT":
+            raw_code = result.get("stock_code")
+            c_code, c_name = get_stock_info(raw_code)
+            result["stock_code"] = c_code
+            result["stock_name"] = c_name
+            
+        return result
+    except Exception as e:
+        print(f"❌ Gemini 智慧意圖解析錯誤: {e}")
         return {"action": "UNKNOWN"}
 
-def extract_trade_intent(user_text: str):
-    clean_text = clean_input_text(user_text)
+# ==========================================
+# 圖片辨識自動建倉功能
+# ==========================================
+def handle_screenshot_image(photo_file_id: str):
+    try:
+        file_info_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/getFile?file_id={photo_file_id}"
+        resp = requests.get(file_info_url, timeout=5).json()
+        if not resp.get("ok"):
+            send_telegram("❌ 無法取得圖片檔案資訊。")
+            return
 
-    is_query_price = any(k in clean_text for k in [
-        "成交價", "現價", "股價", "市價", "最新價", "多少", "價格是多少", "行情", "查價", "報價", "收盤價"
-    ]) and not any(k in clean_text for k in ["買", "賣", "刪", "改"])
-
-    code = None
-    cb_match = re.findall(r'(?:\D|^)(\d{5})(?:\D|$)', clean_text)
-    stock_match = re.findall(r'(?:\D|^)(\d{4})(?:\D|$)', clean_text)
-    if cb_match:
-        code = cb_match[0]
-    elif stock_match:
-        code = stock_match[0]
-
-    if code and is_query_price:
-        _, name = get_stock_info(code)
-        _, m_price, _, _ = get_market_quote(code)
-        return {"action": "GET_PRICE", "stock_code": code, "stock_name": name, "market_price": m_price}
-
-    if any(k in clean_text for k in ["查詢", "查", "持倉", "庫存", "持股"]) and not any(k in clean_text for k in ["成交價", "現價", "股價", "多少"]):
-        sort_profit = any(k in clean_text for k in ["排序", "報酬", "獲利", "績效"])
-        filter_kw = None
-        if code:
-            filter_kw = code
-        else:
-            for word in clean_text.split():
-                if word not in ["查詢", "查", "持倉", "庫存", "持股", "全部"]:
-                    filter_kw = word
-                    break
-
-        return {
-            "action": "QUERY_PORTFOLIO_FILTERED",
-            "filter_keyword": filter_kw,
-            "sort_by_profit": sort_profit
-        }
-
-    lot_matches = re.findall(r'(?:第|地|弟|低|lot\s*#?)\s*(\d+|[一二兩三四五六七八九十]+)\s*筆?', clean_text, re.IGNORECASE)
-    target_lot_ids = []
-    for raw in lot_matches:
-        raw_val = raw.lower()
-        if raw_val.isdigit():
-            target_lot_ids.append(int(raw_val))
-        elif raw_val in CN_NUM_MAP:
-            target_lot_ids.append(CN_NUM_MAP[raw_val])
-    target_lot_ids = list(dict.fromkeys(target_lot_ids))
-
-    is_sell = any(k in clean_text for k in ["賣", "出", "沖", "平倉", "賣掉", "出脫", "砍掉", "出清"])
-    is_delete = any(k in clean_text for k in ["刪除", "移除", "刪掉", "取消", "撤銷", "作廢"])
-    is_buy = any(k in clean_text for k in ["買", "進", "入", "建倉", "加碼"])
-    is_modify = any(k in clean_text for k in ["改", "修", "調", "設"])
-
-    name = None
-    temp_text = clean_text
-
-    if not code:
-        for c_code, info in twstock.codes.items():
-            if info.name in clean_text:
-                code = c_code
-                name = info.name
-                temp_text = clean_text.replace(info.name, ' ')
-                break
-
-    if "預警" in clean_text and any(k in clean_text for k in ["元", "塊", "到", "至", "跌到", "漲到", "價格"]):
-        if not re.search(r'(\d+(?:\.\d+)?|[一二兩三四五六七八九十])\s*(?:%|趴)', clean_text):
-            w_sl = None
-            w_tp = None
-            sl_warn_match = re.search(r'(?:跌到|跌至|跌破|停損|低於)\s*(\d+(?:\.\d+)?)\s*元?', clean_text)
-            if sl_warn_match:
-                w_sl = float(sl_warn_match.group(1))
-
-            tp_warn_match = re.search(r'(?:漲到|漲至|突破|停利|高於|到達)\s*(\d+(?:\.\d+)?)\s*元?', clean_text)
-            if tp_warn_match:
-                w_tp = float(tp_warn_match.group(1))
-
-            if not w_sl and not w_tp:
-                p_match = re.search(r'(\d+(?:\.\d+)?)\s*元?\s*預警', clean_text)
-                if p_match:
-                    val = float(p_match.group(1))
-                    return {
-                        "action": "SET_WARNING_PRICE",
-                        "general_price": val,
-                        "lot_id": target_lot_ids[0] if target_lot_ids else None,
-                        "stock_code": code
-                    }
-
-            if w_sl is not None or w_tp is not None:
-                return {
-                    "action": "SET_WARNING_PRICE",
-                    "warning_sl_price": w_sl,
-                    "warning_tp_price": w_tp,
-                    "lot_id": target_lot_ids[0] if target_lot_ids else None,
-                    "stock_code": code
-                }
-
-    if "預警" in clean_text and any(k in clean_text for k in ["改", "設", "調", "為", "%", "趴"]):
-        warn_match = re.search(r'(\d+(?:\.\d+)?|[一二兩三四五六七八九十])\s*(?:%|趴)?', clean_text)
-        if warn_match:
-            raw_v = warn_match.group(1)
-            pct_val = float(raw_v) if not raw_v in CN_NUM_MAP else float(CN_NUM_MAP[raw_v])
-            is_global = any(k in clean_text for k in ["全部", "所有", "通通", "都"]) or (not target_lot_ids and not code)
-            return {
-                "action": "SET_WARNING_BUFFER",
-                "buffer_percent": pct_val,
-                "lot_id": target_lot_ids[0] if target_lot_ids else None,
-                "stock_code": code,
-                "is_global": is_global
-            }
-
-    qty = 1
-    qty_match = re.search(r'(\d+|[一二兩三四五六七八九十])\s*張', temp_text)
-    if qty_match:
-        q_val = qty_match.group(1)
-        qty = int(q_val) if q_val.isdigit() else CN_NUM_MAP.get(q_val, 1)
-
-    if target_lot_ids and is_delete:
-        return {"action": "DELETE_LOT", "lot_ids": target_lot_ids}
-
-    if is_modify or any(k in clean_text for k in ["停利", "停損", "移動停利"]):
-        is_global = any(k in clean_text for k in ["全部", "所有", "預設", "通通", "所有標的"])
+        file_path = resp["result"]["file_path"]
+        download_url = f"[https://api.telegram.org/file/bot](https://api.telegram.org/file/bot){BOT_TOKEN}/{file_path}"
         
-        ts_match = re.search(r'移動停利.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(?:%|趴)?', clean_text)
-        new_ts = float(ts_match.group(1)) if ts_match else None
+        img_resp = requests.get(download_url, timeout=10)
+        image = Image.open(io.BytesIO(img_resp.content))
 
-        sl_match = re.search(r'停損.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(%|趴|元)?', clean_text)
-        new_sl_val = None
-        new_sl_is_pct = False
-        if sl_match and "停損" in clean_text and "移動" not in clean_text.split("停損")[0]:
-            new_sl_val = float(sl_match.group(1))
-            unit = sl_match.group(2)
-            if unit in ['%', '趴'] or ('%' not in clean_text and '趴' not in clean_text and '元' not in clean_text and new_sl_val < 50):
-                new_sl_is_pct = True
+        prompt = """
+        這是一張台灣股市或可轉債的券商 App 庫存明細截圖。
+        請幫我找出畫面中所有的持股資料，並嚴格以 JSON 格式回傳一個列表（List），不要包含額外文字。
+        每個物件包含以下欄位：
+        - "stock_id": 股票或可轉債的 4 碼或 5 碼代號（例如 "2330", "12331"）
+        - "shares": 持有股數（整數，系統預設以 1 張為 1 單位，若無法判定張數請回傳 1）
+        - "cost": 平均成本價（浮點數，若無則填 0.0）
+        格式範例：
+        [
+          {"stock_id": "2330", "shares": 5, "cost": 600.0},
+          {"stock_id": "2881", "shares": 2, "cost": 50.5}
+        ]
+        """
 
-        tp_match = re.search(r'停利.*?(?:為|改為|調為|設為|改|設)?\s*(\d+(?:\.\d+)?)\s*(%|趴|元)?', clean_text)
-        new_tp_val = None
-        new_tp_is_pct = False
-        if tp_match and "停利" in clean_text and "移動" not in clean_text.split("停利")[0]:
-            new_tp_val = float(tp_match.group(1))
-            unit = tp_match.group(2)
-            if unit in ['%', '趴'] or ('%' not in clean_text and '趴' not in clean_text and '元' not in clean_text and new_tp_val < 100):
-                new_tp_is_pct = True
+        response = client.models.generate_content(
+            model='gemini-3.5-flash-lite',
+            contents=[image, prompt]
+        )
+        
+        text_response = response.text.strip()
+        json_match = re.search(r'\[.*\]', text_response, re.DOTALL)
+        if json_match:
+            holdings = json.loads(json_match.group(0))
+            for item in holdings:
+                s_id = str(item.get("stock_id"))
+                qty = int(item.get("shares", 1))
+                cost = float(item.get("cost", 0.0))
+                
+                if cost > 0:
+                    add_data = {
+                        "stock_code": s_id,
+                        "buy_price": cost,
+                        "quantity": qty
+                    }
+                    handle_add_lot(add_data)
+                else:
+                    _, cur_p, _, _ = get_market_quote(s_id)
+                    add_data = {
+                        "stock_code": s_id,
+                        "buy_price": cur_p or 100.0,
+                        "quantity": qty
+                    }
+                    handle_add_lot(add_data)
+        else:
+            send_telegram(f"⚠️ 無法從截圖中解析出庫存明細格式。\nAI 回應：{text_response}")
 
-        if is_global and (new_sl_val is not None or new_tp_val is not None or new_ts is not None):
-            return {
-                "action": "UPDATE_GLOBAL_SETTINGS_EXT",
-                "new_sl": new_sl_val if "停損" in clean_text else None,
-                "new_tp": new_tp_val if "停利" in clean_text else None,
-                "new_tp_is_pct": new_tp_is_pct,
-                "new_ts": new_ts,
-                "raw_text": clean_text
-            }
-
-        if new_sl_val is not None or new_tp_val is not None or new_ts is not None:
-            return {
-                "action": "UPDATE_SETTINGS",
-                "is_global": is_global,
-                "lot_id": target_lot_ids[0] if target_lot_ids else None,
-                "stock_code": code,
-                "new_sl_val": new_sl_val,
-                "new_sl_is_pct": new_sl_is_pct,
-                "new_tp_val": new_tp_val,
-                "new_tp_is_pct": new_tp_is_pct,
-                "new_ts_percent": new_ts
-            }
-
-    price = None
-    price_match = re.search(r'(?:價格|為|賣|買|成本)?\s*(\d+(?:\.\d+)?)\s*元?', clean_text)
-    if price_match:
-        try:
-            val = float(price_match.group(1))
-            if int(val) not in target_lot_ids and (not code or str(int(val)) != code):
-                price = val
-        except ValueError:
-            pass
-
-    if not price:
-        nums = re.findall(r'(\d+(?:\.\d+)?)', clean_text)
-        candidates = [float(n) for n in nums if n != code and int(float(n)) not in target_lot_ids]
-        if candidates:
-            price = candidates[-1]
-
-    if target_lot_ids and is_sell:
-        return {"action": "SELL_MULTI_LOTS", "lot_ids": target_lot_ids, "sell_price": price, "quantity": qty}
-
-    if code and not name:
-        _, name = get_stock_info(code)
-
-    if code and is_sell:
-        return {"action": "SELL_LOT", "stock_code": code, "stock_name": name, "sell_price": price, "quantity": qty}
-
-    if code and (is_buy or price is not None):
-        return {
-            "action": "ADD_LOT",
-            "stock_code": code,
-            "stock_name": name,
-            "buy_price": price,
-            "quantity": qty,
-            "stop_loss_percent": DEFAULT_STOP_LOSS_PERCENT,
-            "take_profit_percent": DEFAULT_TAKE_PROFIT_PERCENT,
-            "trailing_stop_percent": DEFAULT_TRAILING_STOP_PERCENT,
-            "warning_buffer_percent": DEFAULT_WARNING_BUFFER_PERCENT
-        }
-
-    return ask_gemini_fallback(user_text)
+    except Exception as e:
+        send_telegram(f"❌ 圖片辨識入庫失敗：{e}")
 
 def handle_update_global_settings_ext(data: dict):
     global DEFAULT_STOP_LOSS_PERCENT, DEFAULT_TAKE_PROFIT_PERCENT, DEFAULT_TRAILING_STOP_PERCENT
@@ -1399,9 +1285,6 @@ def background_monitor():
 
         time.sleep(60)
 
-# -------------------------------------------------------------------------
-# 內建極輕量網頁伺服器（對應 Render 免費 Web Service）
-# -------------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -1419,13 +1302,10 @@ def run_web_server():
     server.serve_forever()
 
 def run_bot():
-    print("🤖 周大 AI 交易管家已上線，正在檢查資料庫結構並監聽訊息...")
+    print("🤖 周大 AI 交易管家已上線，正在檢查資料庫結構並監聽訊息與圖片...")
     init_db_schema()
     
-    # 啟動背景盯盤執行緒
     threading.Thread(target=background_monitor, daemon=True).start()
-    
-    # 啟動輕量網頁伺服器執行緒（防休眠）
     threading.Thread(target=run_web_server, daemon=True).start()
 
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -1433,7 +1313,7 @@ def run_bot():
 
     while True:
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/getUpdates"
             params = {"offset": last_update_id + 1, "timeout": 0}
             
             resp = requests.get(url, params=params, headers=headers, timeout=5)
@@ -1448,7 +1328,7 @@ def run_bot():
                             cb_id = cb["id"]
                             cb_data = cb.get("data")
                             
-                            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id})
+                            requests.post(f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id})
                             
                             if cb_data == "SHOW_ALL_PORTFOLIO":
                                 summary_text = get_portfolio_summary_text()
@@ -1456,8 +1336,15 @@ def run_bot():
                             continue
 
                         msg = item.get("message", {})
-                        text = msg.get("text", "").strip()
+                        
+                        if "photo" in msg:
+                            print("📷 收到使用者上傳的庫存截圖...")
+                            photo_file_id = msg["photo"][-1]["file_id"]
+                            send_telegram("🤖 收到您的庫存截圖，AI 正在透過 gemini-3.5-flash-lite 全力辨識中，請稍候...")
+                            threading.Thread(target=handle_screenshot_image, args=(photo_file_id,), daemon=True).start()
+                            continue
 
+                        text = msg.get("text", "").strip()
                         if not text:
                             continue
 
@@ -1468,7 +1355,7 @@ def run_bot():
                         elif text in ["/report", "日報", "風控統計"]:
                             send_daily_market_report()
                         elif text in ["/start", "你好", "哈囉"]:
-                            send_telegram("👋 周大您好！AI 管家已就位。可直接輸入「買進 61041 147元 1張」、「現在 61041 多少」或「查詢」。")
+                            send_telegram("👋 周大您好！AI 管家已就位。可直接輸入「買進 61041 147元 1張」、傳送**庫存截圖**或輸入「查詢」。")
                         else:
                             parsed = extract_trade_intent(text)
                             act = parsed.get("action")
@@ -1499,7 +1386,7 @@ def run_bot():
                             elif act == "QUERY_PORTFOLIO":
                                 handle_query()
                             else:
-                                send_telegram("🤖 收到訊息，如需記帳請指明標的與價格（例如：買進 61041 147元 1張）。")
+                                send_telegram("🤖 收到訊息，如需記帳請指明標的與價格（例如：買進 61041 147元 1張），或直接傳送庫存截圖。")
 
         except Exception:
             pass
