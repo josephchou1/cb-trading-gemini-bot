@@ -374,14 +374,10 @@ def clean_input_text(text: str) -> str:
     t = t.replace('，', ' ').replace('。', ' ')
     return re.sub(r'\s+', ' ', t)
 
-# ==========================================
-# 升級：全面透過 gemini-3.5-flash-lite 進行智慧意圖與代號解析
-# ==========================================
 def extract_trade_intent(user_text: str):
     clean_text = clean_input_text(user_text)
     
-    # 建立強大的提示詞，讓 Gemini 直接處理中文名稱對應、代號查找與參數萃取
-    prompt = f"""
+    prompt = """
 你是一個台灣股市 AI 交易管家助理。請分析使用者的這句話，並嚴格以純 JSON 格式回傳結果（絕對不要包含 ```json 或任何 markdown 標記，只要輸出大括號 {} 內部的 JSON）。
 
 支援的 action 類型：
@@ -392,7 +388,7 @@ def extract_trade_intent(user_text: str):
 - "UPDATE_SETTINGS": 修改設定。
 - "UNKNOWN": 無法辨識。
 
-請解析這句使用者訊息："{clean_text}"
+請解析這句使用者訊息：\"""" + clean_text + """"\"
 """
     try:
         response = client.models.generate_content(
@@ -402,7 +398,6 @@ def extract_trade_intent(user_text: str):
         )
         result = json.loads(response.text.strip())
         
-        # 如果 AI 解析出來是 ADD_LOT 但代號或價格沒抓好，做個安全補正
         if result.get("action") == "ADD_LOT":
             raw_code = result.get("stock_code")
             c_code, c_name = get_stock_info(raw_code)
@@ -414,9 +409,6 @@ def extract_trade_intent(user_text: str):
         print(f"❌ Gemini 智慧意圖解析錯誤: {e}")
         return {"action": "UNKNOWN"}
 
-# ==========================================
-# 圖片辨識自動建倉功能
-# ==========================================
 def handle_screenshot_image(photo_file_id: str):
     try:
         file_info_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/getFile?file_id={photo_file_id}"
