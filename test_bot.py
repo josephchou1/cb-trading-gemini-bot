@@ -138,10 +138,10 @@ def init_db_schema():
     except Exception as e:
         print(f"⚠️ 初始化 schema 提示：{e}")
 
-def send_telegram(text: str, silent: bool = False, reply_markup=None):
+def send_telegram(text: str, silent: bool = False, reply_markup=None, chat_id=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": CHAT_ID,
+        "chat_id": chat_id or CHAT_ID,
         "text": text,
         "disable_notification": silent
     }
@@ -726,6 +726,100 @@ def handle_delete_lot(data: dict):
     except Exception as e:
         send_telegram(f"❌ 刪除持倉失敗：{e}")
 
+def handle_close_all_positions():
+    send_telegram("📤 正在查詢全部持倉行情並準備平倉，請稍候。")
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT lot_id, stock_code, stock_name, buy_price, quantity
+                FROM position_lots
+                WHERE monitoring_status = 'MONITORING'
+                ORDER BY lot_id ASC;
+            """)
+            rows = cur.fetchall()
+            if not rows:
+                cur.close()
+                send_telegram("📋 目前沒有監控中的持倉可平倉。", reply_markup=get_show_portfolio_markup())
+                return
+            closed_lots = 0
+            closed_quantity = 0
+            total_pnl = 0.0
+            skipped = []
+            for lot_id, code, stock_name, buy_price, quantity in rows:
+                _, market_price, _, _ = get_market_quote(code)
+                if market_price is None:
+                    skipped.append(f"{stock_name or code} ({code})")
+                    continue
+                buy_price = float(buy_price)
+                market_price = float(market_price)
+                quantity = int(quantity)
+                pnl = (market_price - buy_price) * quantity * 1000
+                pnl_pct = ((market_price - buy_price) / buy_price) * 100 if buy_price else 0
+                cur.execute("""
+                    UPDATE position_lots SET monitoring_status = 'CLOSED', quantity = 0
+                    WHERE lot_id = %s AND monitoring_status = 'MONITORING';
+                """, (lot_id,))
+                if cur.rowcount != 1:
+                    continue
+                cur.execute("""
+                    INSERT INTO trade_history
+                    (lot_id, stock_code, stock_name, action_type, quantity, price, realized_pnl, realized_pnl_pct, exit_reason)
+                    VALUES (%s, %s, %s, 'FULL_SELL', %s, %s, %s, %s, '全部平倉');
+                """, (lot_id, code, stock_name, quantity, market_price, pnl, pnl_pct))
+                closed_lots += 1
+                closed_quantity += quantity
+                total_pnl += pnl
+            conn.commit()
+            cur.close()
+        sign = "+" if total_pnl >= 0 else ""
+        msg = (f"📤【全部平倉處理完成】\n\n已平倉 {closed_lots} 筆，共 {closed_quantity} 張。"
+               f"\n已實現損益：{sign}{total_pnl:,.0f} 元。")
+        if skipped:
+            msg += "\n\n以下標的無法取得行情，仍保留持倉：\n" + "\n".join(skipped)
+        send_telegram(msg, reply_markup=get_show_portfolio_markup())
+    except Exception as e:
+        send_telegram(f"❌ 全部平倉處理失敗：{e}")
+
+def handle_delete_all_positions():
+    send_telegram("🗑 正在作廢目前全部監控中的持倉，請稍候。")
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT lot_id, stock_code, stock_name, buy_price, quantity
+                FROM position_lots
+                WHERE monitoring_status = 'MONITORING'
+                ORDER BY lot_id ASC;
+            """)
+            rows = cur.fetchall()
+            if not rows:
+                cur.close()
+                send_telegram("📋 目前沒有監控中的持倉可刪除。", reply_markup=get_show_portfolio_markup())
+                return
+            deleted_quantity = 0
+            for lot_id, code, stock_name, buy_price, quantity in rows:
+                cur.execute("""
+                    UPDATE position_lots SET monitoring_status = 'DELETED', quantity = 0
+                    WHERE lot_id = %s AND monitoring_status = 'MONITORING';
+                """, (lot_id,))
+                if cur.rowcount != 1:
+                    continue
+                cur.execute("""
+                    INSERT INTO trade_history
+                    (lot_id, stock_code, stock_name, action_type, quantity, price, realized_pnl, realized_pnl_pct, exit_reason)
+                    VALUES (%s, %s, %s, 'DELETED', %s, %s, 0, 0, '全部刪除作廢');
+                """, (lot_id, code, stock_name, quantity, float(buy_price)))
+                deleted_quantity += int(quantity)
+            conn.commit()
+            cur.close()
+        send_telegram(
+            f"🗑【全部庫存已作廢】\n\n共作廢 {len(rows)} 筆、{deleted_quantity} 張。交易紀錄已新增；庫存流水號會繼續累計。",
+            reply_markup=get_show_portfolio_markup(),
+        )
+    except Exception as e:
+        send_telegram(f"❌ 全部刪除處理失敗：{e}")
+
 def handle_update_settings(data: dict):
     global DEFAULT_TRAILING_STOP_PERCENT
     is_global = data.get("is_global", False)
@@ -1065,8 +1159,10 @@ def handle_add_lot(data: dict):
     except Exception as e:
         send_telegram(f"❌ 寫入失敗：{e}")
 
-def handle_query(filter_keyword: str = None, sort_by_profit: bool = False):
-    send_telegram(get_portfolio_summary_text(filter_keyword=filter_keyword, sort_by_profit=sort_by_profit))
+def handle_query(filter_keyword: str = None, sort_by_profit: bool = False, chat_id=None):
+    send_telegram("📋 正在讀取目前的全部持倉，請稍候。", chat_id=chat_id)
+    summary = get_portfolio_summary_text(filter_keyword=filter_keyword, sort_by_profit=sort_by_profit)
+    send_telegram(summary, chat_id=chat_id, reply_markup=get_show_portfolio_markup())
 
 def handle_get_price(data: dict):
     raw_code = data.get("stock_code")
@@ -1081,20 +1177,6 @@ def handle_get_price(data: dict):
         send_telegram(f"❌ 市場查無 {name} ({code}) 行情。")
     else:
         send_telegram(f"📊 【市場即時行情】\n\n• 標的：{name} ({code})\n• 最新成交價：{price:.2f} 元")
-
-def clear_test_data():
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM trade_history;")
-            cur.execute("DELETE FROM notification_records;")
-            cur.execute("DELETE FROM daily_reports;")
-            cur.execute("DELETE FROM position_lots;")
-            conn.commit()
-            cur.close()
-        send_telegram("🧹 測試資料庫已全數清空！")
-    except Exception as e:
-        send_telegram(f"❌ 清除失敗：{e}")
 
 def send_daily_market_report():
     today = date.today()
@@ -1366,15 +1448,26 @@ def run_bot():
                             cb = item["callback_query"]
                             cb_id = cb["id"]
                             cb_data = cb.get("data")
+                            callback_chat_id = (cb.get("message") or {}).get("chat", {}).get("id")
                             
-                            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=8)
+                            try:
+                                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+                            except Exception as e:
+                                print(f"⚠️ Telegram 按鈕確認失敗：{type(e).__name__}: {e}", flush=True)
                             
+                            if str(callback_chat_id) != str(CHAT_ID):
+                                print("⚠️ 忽略未授權聊天的按鈕事件", flush=True)
+                                continue
+
                             if cb_data == "SHOW_ALL_PORTFOLIO":
-                                summary_text = get_portfolio_summary_text()
-                                send_telegram(summary_text)
+                                print("📋 收到顯示全部庫存按鈕點擊", flush=True)
+                                threading.Thread(target=handle_query, kwargs={"chat_id": callback_chat_id}, daemon=True).start()
                             continue
 
                         msg = item.get("message", {})
+                        if str(msg.get('chat', {}).get('id')) != str(CHAT_ID):
+                            print('⚠️ 忽略未授權聊天的訊息', flush=True)
+                            continue
                         
                         if "photo" in msg:
                             print("📷 收到使用者上傳的庫存截圖...")
@@ -1387,21 +1480,41 @@ def run_bot():
                         if not text:
                             continue
 
-                        print(f"📩 收到訊息: {text}")
+                        print(f"📩 收到訊息: {text}", flush=True)
+                        normalized_text = re.sub(r"[\s，。！？、,.!?]+", "", text).lower()
+                        inventory_phrases = {
+                            "庫存", "查詢", "查詢庫存", "顯示庫存", "顯示全部庫存", "顯示所有庫存",
+                            "顯示目前庫存", "目前庫存", "目前持股", "目前的持股狀況", "顯示目前持股狀況", "目前持股狀況", "持股狀況", "顯示持股", "查看庫存", "查看持股", "持倉清單",
+                            "持股", "清單", "庫存清單", "全部庫存", "所有庫存",
+                            "库存", "查询", "查询库存", "显示库存", "显示全部库存", "显示所有库存",
+                            "当前库存", "当前持股", "当前的持股情况", "持股情况", "清单", "库存清单",
+                        }
+                        close_all_phrases = {"全部平倉", "全數平倉", "平倉全部", "全部出場", "全部賣出", "全部平仓"}
+                        delete_all_phrases = {"全部刪除", "全部删除", "刪除全部庫存", "刪除全部持倉", "刪除全部持仓", "清空庫存", "清空持倉"}
+                        if normalized_text in inventory_phrases:
+                            threading.Thread(target=handle_query, daemon=True).start()
+                            continue
+                        if normalized_text in close_all_phrases:
+                            threading.Thread(target=handle_close_all_positions, daemon=True).start()
+                            continue
+                        if normalized_text in delete_all_phrases:
+                            threading.Thread(target=handle_delete_all_positions, daemon=True).start()
+                            continue
 
-                        if text == "/clear_test":
-                            clear_test_data()
-                        elif text in ["/report", "日報", "風控統計"]:
+                        if text in ["/report", "日報", "風控統計"]:
                             send_daily_market_report()
                         elif text in ["/start", "你好", "哈囉"]:
                             send_telegram("👋 周大您好！AI 管家已就位。可直接輸入「買進 61041 147元 1張」、傳送**庫存截圖**或輸入「查詢」。")
                         else:
                             parsed = extract_trade_intent(text)
                             act = parsed.get("action")
-                            print(f"👉 動作判斷: {act}")
+                            print(f"👉 動作判斷: {act}", flush=True)
 
                             if act == "QUERY_PORTFOLIO_FILTERED":
-                                handle_query(filter_keyword=parsed.get("filter_keyword"), sort_by_profit=parsed.get("sort_by_profit", False))
+                                threading.Thread(target=handle_query, kwargs={
+                                    "filter_keyword": parsed.get("filter_keyword"),
+                                    "sort_by_profit": parsed.get("sort_by_profit", False),
+                                }, daemon=True).start()
                             elif act == "SET_WARNING_PRICE":
                                 handle_set_warning_price(parsed)
                             elif act == "SET_WARNING_BUFFER":
@@ -1423,7 +1536,7 @@ def run_bot():
                             elif act == "SELL_LOT":
                                 handle_sell_lot(parsed)
                             elif act == "QUERY_PORTFOLIO":
-                                handle_query()
+                                threading.Thread(target=handle_query, daemon=True).start()
                             else:
                                 send_telegram("🤖 收到訊息，如需記帳請指明標的與價格（例如：買進 61041 147元 1張），或直接傳送庫存截圖。")
             else:
