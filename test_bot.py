@@ -1306,7 +1306,8 @@ def send_monitor_alert(cur, conn, lot_id, trade_day, event_type, trigger_price, 
     is_warning = event_type.startswith("APPROACHING_")
     delivery_count = 1 if is_warning else 2
     for attempt in range(delivery_count):
-        result = send_telegram(message, silent=False)
+        alert_message = message if attempt == 0 else "🚨【已觸價，請紀律出場！】🚨"
+        result = send_telegram(alert_message, silent=False)
         if result is None:
             print(f"❌ {event_type} 第 {attempt + 1} 次通知未送達，第 {lot_id} 筆將在下次巡檢重試", flush=True)
             return False
