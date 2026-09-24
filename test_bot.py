@@ -1303,12 +1303,15 @@ def send_daily_market_report(closing_report: bool = False):
 
 def send_monitor_alert(cur, conn, lot_id, trade_day, event_type, trigger_price, message):
     """Only suppress an alert after Telegram confirms successful delivery."""
-    # Warnings are quiet; actual stop/take-profit triggers remain audible.
     is_warning = event_type.startswith("APPROACHING_")
-    result = send_telegram(message, silent=is_warning)
-    if result is None:
-        print(f"❌ {event_type} 通知未送達，第 {lot_id} 筆將在下次巡檢重試", flush=True)
-        return False
+    delivery_count = 1 if is_warning else 2
+    for attempt in range(delivery_count):
+        result = send_telegram(message, silent=False)
+        if result is None:
+            print(f"❌ {event_type} 第 {attempt + 1} 次通知未送達，第 {lot_id} 筆將在下次巡檢重試", flush=True)
+            return False
+        if attempt + 1 < delivery_count:
+            time.sleep(1)
 
     cur.execute(
         "INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, %s, %s);",
