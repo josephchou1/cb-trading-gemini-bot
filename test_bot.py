@@ -19,6 +19,7 @@ from google.genai import types
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from typing import Literal
+from uuid import uuid4
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
@@ -571,6 +572,115 @@ def _prepare_holdings_image(image_bytes: bytes):
 def _normalise_label(value):
     return re.sub(r"[\s0-9０-９（）()【】［］《》、，,。._・-]+", "", str(value or "")).lower()
 
+def _screenshot_import_markup(pending):
+    token = pending["token"]
+    rows = pending["rows"]
+    selected = pending["selected"]
+    keyboard = []
+    for index, item in enumerate(rows):
+        checked = index in selected
+        symbol = "☑️" if checked else "⬜"
+        name = item["stock_name"]
+        if len(name) > 10:
+            name = name[:10] + "…"
+        label = f"{symbol} {index + 1}. {name} {item['stock_code']}｜{item['quantity']}張"
+        keyboard.append([{
+            "text": label,
+            "callback_data": f"IMG_TOGGLE:{token}:{index}",
+        }])
+    keyboard.append([
+        {"text": "全選", "callback_data": f"IMG_SELECT_ALL:{token}"},
+        {"text": "清除", "callback_data": f"IMG_CLEAR:{token}"},
+    ])
+    keyboard.append([
+        {"text": f"確認匯入（{len(selected)}筆）", "callback_data": f"IMG_CONFIRM:{token}"},
+        {"text": "取消整批", "callback_data": f"IMG_CANCEL:{token}"},
+    ])
+    return {"inline_keyboard": keyboard}
+
+def _edit_screenshot_import_markup(chat_id, message_id, markup):
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageReplyMarkup",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": markup,
+            },
+            timeout=5,
+        )
+        if response.status_code != 200 or not response.json().get("ok"):
+            print(f"⚠️ 更新截圖勾選按鈕失敗：{response.text[:200]}", flush=True)
+    except Exception as e:
+        safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
+        print(f"⚠️ 更新截圖勾選按鈕錯誤：{type(e).__name__}: {safe_error}", flush=True)
+
+def handle_screenshot_import_callback(callback_data, chat_id, message_id):
+    parts = str(callback_data or "").split(":")
+    if len(parts) < 2:
+        return
+    action, token = parts[0], parts[1]
+    chat_key = str(chat_id)
+    with PENDING_SCREENSHOT_LOCK:
+        pending = PENDING_SCREENSHOT_IMPORTS.get(chat_key)
+        if not pending or pending.get("token") != token:
+            pending = None
+        elif action == "IMG_TOGGLE" and len(parts) == 3:
+            try:
+                index = int(parts[2])
+                if index < 0 or index >= len(pending["rows"]):
+                    return
+                if index in pending["selected"]:
+                    pending["selected"].remove(index)
+                else:
+                    pending["selected"].add(index)
+            except ValueError:
+                return
+        elif action == "IMG_SELECT_ALL":
+            pending["selected"] = set(range(len(pending["rows"])))
+        elif action == "IMG_CLEAR":
+            pending["selected"].clear()
+
+        if pending and action in {"IMG_TOGGLE", "IMG_SELECT_ALL", "IMG_CLEAR"}:
+            markup = _screenshot_import_markup(pending)
+            target_message_id = pending.get("message_id") or message_id
+        elif pending and action == "IMG_CONFIRM":
+            if not pending["selected"]:
+                send_telegram("請先勾選至少一筆要匯入的庫存。", chat_id=chat_id)
+                return
+            selected_rows = [
+                item for index, item in enumerate(pending["rows"])
+                if index in pending["selected"]
+            ]
+            PENDING_SCREENSHOT_IMPORTS.pop(chat_key, None)
+            markup = {"inline_keyboard": []}
+            target_message_id = pending.get("message_id") or message_id
+        elif pending and action == "IMG_CANCEL":
+            PENDING_SCREENSHOT_IMPORTS.pop(chat_key, None)
+            selected_rows = []
+            markup = {"inline_keyboard": []}
+            target_message_id = pending.get("message_id") or message_id
+        else:
+            return
+
+    _edit_screenshot_import_markup(chat_id, target_message_id, markup)
+    if action == "IMG_CONFIRM":
+        imported, failed = [], []
+        for item in selected_rows:
+            lot_id = handle_add_lot(item, notify=False)
+            if lot_id is None:
+                failed.append(f"{item['stock_name']} ({item['stock_code']})")
+            else:
+                imported.append(f"第 {lot_id} 筆：{item['stock_name']} ({item['stock_code']})")
+        message = "✅ 已匯入勾選的庫存。"
+        if imported:
+            message += "\\n" + "\\n".join(imported)
+        if failed:
+            message += "\\n\\n⚠️ 未能新增：" + "、".join(failed)
+        send_telegram(message, chat_id=chat_id, reply_markup=get_show_portfolio_markup())
+    elif action == "IMG_CANCEL":
+        send_telegram("已取消這批截圖匯入，沒有新增庫存。", chat_id=chat_id)
+
 def handle_screenshot_image(photo_file_id: str):
     try:
         info = requests.get(
@@ -660,7 +770,7 @@ def handle_screenshot_image(photo_file_id: str):
             )
             return
 
-        preview = ["🔎 AI 辨識草稿，請核對後再新增："]
+        preview = ["🔎 AI 辨識草稿：請勾選想匯入的項目，確認前不會新增庫存。"]
         for i, row in enumerate(rows, 1):
             q = f"{row['source_quantity']} {row['source_unit']}"
             if row["source_unit"] == "股":
@@ -669,10 +779,21 @@ def handle_screenshot_image(photo_file_id: str):
             preview.append(f"{i}. {row['stock_name']} ({row['stock_code']})｜{q}｜買進均價 {row['buy_price']:.2f} 元{mark}")
             if row["evidence"]:
                 preview.append(f"   辨識依據：{row['evidence']}")
-        preview.extend(["", "正確請回覆「確認匯入」；要放棄請回覆「取消匯入」。"])
+        preview.extend(["", "點擊每筆左側方框選取；也可用「全選」或「清除」。"])
+        pending = {
+            "token": uuid4().hex[:8],
+            "rows": rows,
+            "selected": set(),
+            "message_id": None,
+        }
         with PENDING_SCREENSHOT_LOCK:
-            PENDING_SCREENSHOT_IMPORTS[str(CHAT_ID)] = rows
-        send_telegram("\n".join(preview))
+            PENDING_SCREENSHOT_IMPORTS[str(CHAT_ID)] = pending
+        sent = send_telegram(
+            "\n".join(preview),
+            reply_markup=_screenshot_import_markup(pending),
+        )
+        if sent and sent.get("result"):
+            pending["message_id"] = sent["result"].get("message_id")
     except Exception as e:
         safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
         print(f"❌ 截圖辨識失敗：{type(e).__name__}: {safe_error}", flush=True)
@@ -1726,6 +1847,12 @@ def run_bot():
                             if cb_data == "SHOW_ALL_PORTFOLIO":
                                 print("📋 收到顯示全部庫存按鈕點擊", flush=True)
                                 threading.Thread(target=handle_query, kwargs={"chat_id": callback_chat_id}, daemon=True).start()
+                            elif str(cb_data or "").startswith("IMG_"):
+                                handle_screenshot_import_callback(
+                                    cb_data,
+                                    callback_chat_id,
+                                    (cb.get("message") or {}).get("message_id"),
+                                )
                             continue
 
                         msg = item.get("message", {})
@@ -1746,24 +1873,7 @@ def run_bot():
 
                         normalized_text = re.sub(r"[\s，。！？、,.!?]+", "", text).lower()
                         if normalized_text in {"確認匯入", "确认导入", "確認新增", "确认新增"}:
-                            with PENDING_SCREENSHOT_LOCK:
-                                pending = PENDING_SCREENSHOT_IMPORTS.pop(str(CHAT_ID), None)
-                            if not pending:
-                                send_telegram("目前沒有等待確認的截圖辨識結果。")
-                                continue
-                            imported, failed = [], []
-                            for record in pending:
-                                lot_id = handle_add_lot(record, notify=False)
-                                if lot_id is None:
-                                    failed.append(f"{record['stock_name']} ({record['stock_code']})")
-                                else:
-                                    imported.append(f"第 {lot_id} 筆：{record['stock_name']} ({record['stock_code']})")
-                            summary = "✅ 截圖匯入完成。"
-                            if imported:
-                                summary += "\n" + "\n".join(imported)
-                            if failed:
-                                summary += "\n\n⚠️ 未能新增：" + "、".join(failed)
-                            send_telegram(summary, reply_markup=get_show_portfolio_markup())
+                            send_telegram("請在辨識草稿下方勾選項目，再按「確認匯入」。")
                             continue
                         if normalized_text in {"取消匯入", "取消导入", "放棄匯入", "放弃导入"}:
                             with PENDING_SCREENSHOT_LOCK:
