@@ -5,7 +5,7 @@ import re
 import threading
 import io
 from pathlib import Path
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone
 from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -122,7 +122,8 @@ def init_db_schema():
                 ADD COLUMN IF NOT EXISTS warning_buffer_percent NUMERIC DEFAULT 1.0,
                 ADD COLUMN IF NOT EXISTS warning_sl_price NUMERIC,
                 ADD COLUMN IF NOT EXISTS warning_tp_price NUMERIC,
-                ADD COLUMN IF NOT EXISTS ts_activation_percent NUMERIC DEFAULT 3.0;
+                ADD COLUMN IF NOT EXISTS ts_activation_percent NUMERIC DEFAULT 3.0,
+                ADD COLUMN IF NOT EXISTS monitoring_started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
                 
                 CREATE TABLE IF NOT EXISTS daily_reports (
                     report_date DATE PRIMARY KEY,
@@ -209,7 +210,19 @@ def send_telegram(text: str, silent: bool = False, reply_markup=None, chat_id=No
 def get_market_quote(code: str):
     code, name = get_stock_info(code)
     if not code:
-        return None, None, None, None
+        return None, None, None, None, None
+
+    def quote_time(value):
+        """Convert provider timestamps (seconds or Fugle microseconds) to UTC."""
+        if value is None:
+            return None
+        try:
+            timestamp = float(value)
+            if timestamp > 100_000_000_000:
+                timestamp /= 1_000_000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
 
     if len(code) in (5, 6) and code.isdigit():
         try:
@@ -220,7 +233,8 @@ def get_market_quote(code: str):
                 d = resp_f.json()
                 price = d.get("closePrice") or d.get("lastUpdatedPrice") or (d.get("trade", {}).get("price") if isinstance(d.get("trade"), dict) else None)
                 if price:
-                    return name, float(price), float(d.get("highPrice", price)), float(d.get("lowPrice", price))
+                    trade_time = d.get("closeTime") or (d.get("lastTrade", {}).get("time") if isinstance(d.get("lastTrade"), dict) else None)
+                    return name, float(price), float(d.get("highPrice", price)), float(d.get("lowPrice", price)), quote_time(trade_time)
         except Exception:
             pass
 
@@ -236,7 +250,7 @@ def get_market_quote(code: str):
                         meta = result[0]["meta"]
                         price = meta.get("regularMarketPrice")
                         if price:
-                            return name, float(price), float(meta.get("regularMarketDayHigh", price)), float(meta.get("regularMarketDayLow", price))
+                            return name, float(price), float(meta.get("regularMarketDayHigh", price)), float(meta.get("regularMarketDayLow", price)), quote_time(meta.get("regularMarketTime"))
             except Exception:
                 pass
 
@@ -256,7 +270,8 @@ def get_market_quote(code: str):
                 high = d.get("highPrice")
                 low = d.get("lowPrice")
                 if price:
-                    return name, float(price), float(high) if high else float(price), float(low) if low else float(price)
+                    trade_time = d.get("closeTime") or (d.get("lastTrade", {}).get("time") if isinstance(d.get("lastTrade"), dict) else None)
+                    return name, float(price), float(high) if high else float(price), float(low) if low else float(price), quote_time(trade_time)
         except Exception:
             pass
 
@@ -274,11 +289,11 @@ def get_market_quote(code: str):
                     high = meta.get("regularMarketDayHigh")
                     low = meta.get("regularMarketDayLow")
                     if price:
-                        return name, float(price), float(high) if high else float(price), float(low) if low else float(price)
+                        return name, float(price), float(high) if high else float(price), float(low) if low else float(price), quote_time(meta.get("regularMarketTime"))
         except Exception:
             pass
 
-    return name, None, None, None
+    return name, None, None, None, None
 
 def get_portfolio_summary_text(filter_keyword: str = None, sort_by_profit: bool = False) -> str:
     try:
@@ -336,7 +351,7 @@ def get_portfolio_summary_text(filter_keyword: str = None, sort_by_profit: bool 
                 if not matched_kw:
                     continue
 
-            _, cur_price, _, _ = get_market_quote(code)
+            _, cur_price, _, _, _ = get_market_quote(code)
             if cur_price is not None:
                 cur_price = float(cur_price)
                 diff_val = cur_price - buy_price
@@ -529,7 +544,7 @@ def handle_screenshot_image(photo_file_id: str):
                     }
                     handle_add_lot(add_data)
                 else:
-                    _, cur_p, _, _ = get_market_quote(s_id)
+                    _, cur_p, _, _, _ = get_market_quote(s_id)
                     add_data = {
                         "stock_code": s_id,
                         "buy_price": cur_p or 100.0,
@@ -796,7 +811,7 @@ def handle_close_all_positions():
             total_pnl = 0.0
             skipped = []
             for lot_id, code, stock_name, buy_price, quantity in rows:
-                _, market_price, _, _ = get_market_quote(code)
+                _, market_price, _, _, _ = get_market_quote(code)
                 if market_price is None:
                     skipped.append(f"{stock_name or code} ({code})")
                     continue
@@ -1018,7 +1033,7 @@ def handle_sell_multi_lots(data: dict):
 
                 sell_price = custom_sell_price
                 if not sell_price:
-                    _, market_p, _, _ = get_market_quote(code)
+                    _, market_p, _, _, _ = get_market_quote(code)
                     sell_price = market_p
 
                 if not sell_price:
@@ -1077,7 +1092,7 @@ def handle_sell_lot(data: dict):
         return
 
     if not sell_price:
-        _, market_p, _, _ = get_market_quote(code)
+        _, market_p, _, _, _ = get_market_quote(code)
         sell_price = market_p
 
     if not sell_price:
@@ -1339,24 +1354,36 @@ def background_monitor():
                     SELECT lot_id, stock_code, stock_name, buy_price, stop_loss_price, 
                            take_profit_price, quantity, stop_loss_percent, take_profit_percent, 
                            highest_price, trailing_stop_percent, warning_buffer_percent, 
-                           warning_sl_price, warning_tp_price, ts_activation_percent
+                           warning_sl_price, warning_tp_price, ts_activation_percent,
+                           monitoring_started_at, buy_date
                     FROM position_lots 
                     WHERE monitoring_status = 'MONITORING';
                 """)
                 lots = cur.fetchall()
 
                 for lot in lots:
-                    lot_id, code, _, buy_p, sl_p, tp_p, qty, sl_pct, tp_pct, high_p, ts_pct, wb_pct, w_sl_p, w_tp_p, ts_act_p = lot
+                    lot_id, code, _, buy_p, sl_p, tp_p, qty, sl_pct, tp_pct, high_p, ts_pct, wb_pct, w_sl_p, w_tp_p, ts_act_p, monitoring_started_at, buy_date = lot
                     _, name = get_stock_info(code)
-                    _, cur_price, day_high, day_low = get_market_quote(code)
+                    _, cur_price, day_high, day_low, quote_time = get_market_quote(code)
                     if cur_price is None:
                         print(f"⚠️ 台北時間 {taipei_now():%H:%M:%S} 行情取得失敗，跳過第 {lot_id} 筆 ({code}) 風控檢查", flush=True)
+                        continue
+
+                    if quote_time is None:
+                        print(f"⚠️ {code} 行情沒有可確認的成交時間，略過風控檢查，避免使用舊行情觸發通知", flush=True)
+                        continue
+                    if quote_time <= monitoring_started_at:
+                        print(f"ℹ️ {code} 最新成交時間早於或等於監控建立時間，略過本次風控檢查", flush=True)
                         continue
 
                     cur_price = float(cur_price)
                     session_high = float(day_high) if day_high is not None else cur_price
                     session_low = float(day_low) if day_low is not None else cur_price
                     today = taipei_now().date()
+                    if buy_date == today:
+                        # Intraday extremes may have happened before this lot was registered.
+                        session_high = cur_price
+                        session_low = cur_price
                     buy_val = float(buy_p)
                     sl_val = float(sl_p)
                     tp_val = float(tp_p)
