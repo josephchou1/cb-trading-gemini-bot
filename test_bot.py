@@ -16,7 +16,9 @@ import twstock
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from PIL import Image
+from PIL import Image, ImageOps
+from pydantic import BaseModel, Field
+from typing import Literal
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
@@ -38,6 +40,22 @@ if missing_env:
     raise RuntimeError("缺少必要環境變數：" + ", ".join(missing_env))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+class ScreenshotHoldingRow(BaseModel):
+    stock_code: str | None = Field(description="股票或可轉債代碼，保留全部數字及前導零")
+    stock_name: str | None = Field(description="畫面顯示的完整名稱")
+    quantity: int | None = Field(description="股數或張數")
+    quantity_unit: Literal["張", "股", "手", "未知"]
+    average_buy_price: float | None = Field(description="成交均價或買入均價，不可用現價或成本總額代替")
+    confidence: Literal["high", "medium", "low"]
+    evidence: str = Field(description="欄位標題和該列的簡短原文")
+
+class ScreenshotHoldings(BaseModel):
+    rows: list[ScreenshotHoldingRow]
+    warnings: list[str]
+
+PENDING_SCREENSHOT_IMPORTS = {}
+PENDING_SCREENSHOT_LOCK = threading.Lock()
 
 db_pool = None
 try:
@@ -521,68 +539,144 @@ def extract_trade_intent(user_text: str):
         print(f"❌ Gemini 智慧意圖解析錯誤: {e}")
         return {"action": "UNKNOWN"}
 
+def _prepare_holdings_image(image_bytes: bytes):
+    image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+    gray = image.convert("L")
+    width, height = image.size
+    x_step, y_step = max(1, width // 240), max(1, height // 900)
+    xs = range(0, width, x_step)
+    active = []
+    for y in range(0, height, y_step):
+        if sum(gray.getpixel((x, y)) >= 70 for x in xs) / max(1, len(range(0, width, x_step))) >= 0.32:
+            active.append(y)
+    best = (0, 0)
+    gap = max(y_step * 3, int(height * 0.004))
+    if active:
+        start = prev = active[0]
+        for y in active[1:]:
+            if y - prev > gap:
+                if prev - start > best[1] - best[0]:
+                    best = (start, prev)
+                start = y
+            prev = y
+        if prev - start > best[1] - best[0]:
+            best = (start, prev)
+    if best[1] - best[0] >= int(height * 0.08):
+        margin = max(12, int((best[1] - best[0]) * 0.025))
+        image = image.crop((0, max(0, best[0] - margin), width, min(height, best[1] + margin)))
+    if image.width < 1800:
+        image = image.resize((1800, int(image.height * 1800 / image.width)), Image.Resampling.LANCZOS)
+    return image
+
+def _normalise_label(value):
+    return re.sub(r"[\\s0-9０-９（）()【】［］《》、，,。._・-]+", "", str(value or "")).lower()
+
 def handle_screenshot_image(photo_file_id: str):
     try:
-        file_info_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
-        resp = requests.get(file_info_url, params={"file_id": photo_file_id}, timeout=5).json()
-        if not resp.get("ok"):
+        info = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+            params={"file_id": photo_file_id}, timeout=5
+        ).json()
+        if not info.get("ok"):
             send_telegram("❌ 無法取得圖片檔案資訊。")
             return
-
-        file_path = resp["result"]["file_path"]
-        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-        
-        img_resp = requests.get(download_url, timeout=10)
-        image = Image.open(io.BytesIO(img_resp.content))
+        file_path = info["result"]["file_path"]
+        image_response = requests.get(
+            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}", timeout=15
+        )
+        image_response.raise_for_status()
+        image = _prepare_holdings_image(image_response.content)
 
         prompt = """
-        這是一張台灣股市或可轉債的券商 App 庫存明細截圖。
-        請幫我找出畫面中所有的持股資料，並嚴格以 JSON 格式回傳一個列表（List），不要包含額外文字。
-        每個物件包含以下欄位：
-        - "stock_id": 股票或可轉債的 4、5 或 6 碼代號（例如 "2330", "12331", "622010"）；代碼須保留為字串，不得省略末尾的 0。
-        - "shares": 持有股數（整數，系統預設以 1 張為 1 單位，若無法判定張數請回傳 1）
-        - "cost": 平均成本價（浮點數，若無則填 0.0）
-        格式範例：
-        [
-          {"stock_id": "2330", "shares": 5, "cost": 600.0},
-          {"stock_id": "2881", "shares": 2, "cost": 50.5}
-        ]
-        """
-
+你是台灣股票與可轉債券商庫存截圖的辨識助手。不同券商版面、欄位順序和欄位名稱可能不同；必須依表頭和每列內容判斷，不可依固定座標猜。
+逐列抽取：標的代碼、完整名稱、股數或張數、買進成交均價。
+名稱欄可能叫股名、股票名稱、標的名稱、商品名稱；代碼欄可能叫股票代號、代碼、證券代號。名稱和代碼可能在同一格，如「4108 懷特」，也可能分欄。
+數量欄可能叫股數、持有股數、庫存股數、持倉數量、張數或持有張數。依券商畫面辨識單位是股或張；看不出來要填未知，不可只看數字猜。
+買進單價欄可能叫成交均價、買進均價、買入均價、平均成本、成本單價、買進價格、買入價格。不可把現價、市價、投資成本總額、帳面收入、損益或報酬率當成買進均價。
+代碼須保留原有所有數字與前導零。可轉債代碼可為5或6位數，不能丟掉末碼；可轉債完整名稱可能在股票名稱後加一、二、三、四、五、六等序號。
+只抽實際持倉列，略過表頭、合計、現金和總結。必要欄位不清楚時回傳 null 並記錄 warnings，不要猜；evidence 簡短寫出表頭和該列依據。
+"""
         response = client.models.generate_content(
-            model='gemini-3.5-flash-lite',
-            contents=[image, prompt]
+            model="gemini-3.5-flash-lite",
+            contents=[image, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ScreenshotHoldings,
+                temperature=0.1,
+            ),
         )
-        
-        text_response = response.text.strip()
-        json_match = re.search(r'\[.*\]', text_response, re.DOTALL)
-        if json_match:
-            holdings = json.loads(json_match.group(0))
-            for item in holdings:
-                s_id = str(item.get("stock_id"))
-                qty = int(item.get("shares", 1))
-                cost = float(item.get("cost", 0.0))
-                
-                if cost > 0:
-                    add_data = {
-                        "stock_code": s_id,
-                        "buy_price": cost,
-                        "quantity": qty
-                    }
-                    handle_add_lot(add_data)
-                else:
-                    _, cur_p, _, _, _, _, _ = get_market_quote(s_id)
-                    add_data = {
-                        "stock_code": s_id,
-                        "buy_price": cur_p or 100.0,
-                        "quantity": qty
-                    }
-                    handle_add_lot(add_data)
-        else:
-            send_telegram(f"⚠️ 無法從截圖中解析出庫存明細格式。\nAI 回應：{text_response}")
+        if not response.text:
+            send_telegram("⚠️ AI 沒有回傳可讀結果，沒有新增庫存。請傳送表頭與資料列清楚的截圖。")
+            return
+        extraction = ScreenshotHoldings.model_validate_json(response.text)
+        if not extraction.rows:
+            send_telegram("⚠️ 圖片中沒有可辨識的持倉列，沒有新增庫存。")
+            return
 
+        rows, issues = [], []
+        for i, row in enumerate(extraction.rows, 1):
+            code = re.sub(r"[^0-9]", "", str(row.stock_code or ""))
+            name = str(row.stock_name or "").strip()
+            if len(code) not in (4, 5, 6):
+                issues.append(f"第{i}列代碼不清楚或格式錯誤")
+                continue
+            code, official_name = get_stock_info(code)
+            if not code or official_name == code or official_name.startswith("可轉債"):
+                issues.append(f"第{i}列代碼無法核對")
+                continue
+            if not name or row.quantity is None or row.quantity <= 0 or row.average_buy_price is None or row.average_buy_price <= 0:
+                issues.append(f"第{i}列名稱、數量或買進均價不完整")
+                continue
+            if row.confidence == "low":
+                issues.append(f"第{i}列辨識把握低")
+                continue
+            name_norm, official_norm = _normalise_label(name), _normalise_label(official_name)
+            base_name = get_stock_info(code[:4])[1] if len(code) in (5, 6) else official_name
+            base_norm = _normalise_label(base_name)
+            if not (name_norm in official_norm or official_norm in name_norm or name_norm in base_norm or base_norm in name_norm):
+                issues.append(f"第{i}列名稱「{name}」和代碼對應名稱「{official_name}」不符")
+                continue
+
+            source_qty = int(row.quantity)
+            if row.quantity_unit == "股":
+                qty = (source_qty + 999) // 1000
+            elif row.quantity_unit == "張":
+                qty = source_qty
+            else:
+                issues.append(f"第{i}列股數／張數單位無法確認")
+                continue
+            rows.append({
+                "stock_code": code, "stock_name": official_name,
+                "buy_price": float(row.average_buy_price), "quantity": qty,
+                "source_quantity": source_qty, "source_unit": row.quantity_unit,
+                "confidence": row.confidence, "evidence": row.evidence,
+            })
+
+        if issues or len(rows) != len(extraction.rows):
+            send_telegram(
+                "⚠️ 有欄位不清楚或名稱、代碼對不上，為避免建錯庫存，這張圖完全沒有新增。\n"
+                + "\n".join("• " + x for x in issues[:10])
+                + "\n請傳送裁切清楚的截圖，或手動輸入資料。"
+            )
+            return
+
+        preview = ["🔎 AI 辨識草稿，請核對後再新增："]
+        for i, row in enumerate(rows, 1):
+            q = f"{row['source_quantity']} {row['source_unit']}"
+            if row["source_unit"] == "股":
+                q += f"（換算 {row['quantity']} 張，未滿1張無條件進位）"
+            mark = "（請特別核對）" if row["confidence"] == "medium" else ""
+            preview.append(f"{i}. {row['stock_name']} ({row['stock_code']})｜{q}｜買進均價 {row['buy_price']:.2f} 元{mark}")
+            if row["evidence"]:
+                preview.append(f"   辨識依據：{row['evidence']}")
+        preview.extend(["", "正確請回覆「確認匯入」；要放棄請回覆「取消匯入」。"])
+        with PENDING_SCREENSHOT_LOCK:
+            PENDING_SCREENSHOT_IMPORTS[str(CHAT_ID)] = rows
+        send_telegram("\\n".join(preview))
     except Exception as e:
-        send_telegram(f"❌ 圖片辨識入庫失敗：{e}")
+        safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
+        print(f"❌ 截圖辨識失敗：{type(e).__name__}: {safe_error}", flush=True)
+        send_telegram("❌ 截圖辨識失敗，沒有新增任何庫存。請確認圖片清楚並再傳一次。")
 
 def handle_update_global_settings_ext(data: dict):
     global DEFAULT_STOP_LOSS_PERCENT, DEFAULT_TAKE_PROFIT_PERCENT, DEFAULT_TRAILING_STOP_PERCENT
@@ -1193,14 +1287,15 @@ def handle_sell_lot(data: dict):
     except Exception as e:
         send_telegram(f"❌ 沖銷失敗：{e}")
 
-def handle_add_lot(data: dict):
+def handle_add_lot(data: dict, notify: bool = True):
     code = data.get("stock_code")
     _, name = get_stock_info(code)
     raw_price = data.get("buy_price")
     
     if not code or raw_price is None:
-        send_telegram("⚠️ 未能確認有效的代號或買進價格，請重新輸入。")
-        return
+        if notify:
+            send_telegram("⚠️ 未能確認有效的代號或買進價格，請重新輸入。")
+        return None
 
     buy_price = float(raw_price)
     qty = int(data.get("quantity") or 1)
@@ -1246,9 +1341,13 @@ def handle_add_lot(data: dict):
             f"• 移動停利：{ts_pct:.1f}%（獲利達 +{ts_act_pct:.1f}% 啟動）\n"
             f"• 預警通知：{wb_pct:.1f}%"
         )
-        send_telegram(msg, reply_markup=get_show_portfolio_markup())
+        if notify:
+            send_telegram(msg, reply_markup=get_show_portfolio_markup())
+        return lot_id
     except Exception as e:
-        send_telegram(f"❌ 寫入失敗：{e}")
+        if notify:
+            send_telegram(f"❌ 寫入失敗：{e}")
+        return None
 
 def handle_query(filter_keyword: str = None, sort_by_profit: bool = False, chat_id=None):
     send_telegram("📋 正在讀取目前的全部持倉，請稍候。", chat_id=chat_id)
@@ -1643,6 +1742,33 @@ def run_bot():
 
                         text = msg.get("text", "").strip()
                         if not text:
+                            continue
+
+                        normalized_text = re.sub(r"[\\s，。！？、,.!?]+", "", text).lower()
+                        if normalized_text in {"確認匯入", "确认导入", "確認新增", "确认新增"}:
+                            with PENDING_SCREENSHOT_LOCK:
+                                pending = PENDING_SCREENSHOT_IMPORTS.pop(str(CHAT_ID), None)
+                            if not pending:
+                                send_telegram("目前沒有等待確認的截圖辨識結果。")
+                                continue
+                            imported, failed = [], []
+                            for record in pending:
+                                lot_id = handle_add_lot(record, notify=False)
+                                if lot_id is None:
+                                    failed.append(f"{record['stock_name']} ({record['stock_code']})")
+                                else:
+                                    imported.append(f"第 {lot_id} 筆：{record['stock_name']} ({record['stock_code']})")
+                            summary = "✅ 截圖匯入完成。"
+                            if imported:
+                                summary += "\\n" + "\\n".join(imported)
+                            if failed:
+                                summary += "\\n\\n⚠️ 未能新增：" + "、".join(failed)
+                            send_telegram(summary, reply_markup=get_show_portfolio_markup())
+                            continue
+                        if normalized_text in {"取消匯入", "取消导入", "放棄匯入", "放弃导入"}:
+                            with PENDING_SCREENSHOT_LOCK:
+                                removed = PENDING_SCREENSHOT_IMPORTS.pop(str(CHAT_ID), None)
+                            send_telegram("已取消截圖匯入，沒有新增庫存。" if removed else "目前沒有等待確認的截圖辨識結果。")
                             continue
 
                         print(f"📩 收到訊息: {text}", flush=True)
