@@ -47,11 +47,12 @@ class ScreenshotHoldingRow(BaseModel):
     stock_name: str | None = Field(description="畫面顯示的完整名稱")
     quantity: int | None = Field(description="股數或張數")
     quantity_unit: Literal["張", "股", "手", "未知"]
-    average_buy_price: float | None = Field(description="成交均價或買入均價，不可用現價或成本總額代替")
+    average_buy_price: float | None = Field(description="買進單價或持倉成本單價；不得使用現價、市價或總成本")
     confidence: Literal["high", "medium", "low"]
     evidence: str = Field(description="欄位標題和該列的簡短原文")
 
 class ScreenshotHoldings(BaseModel):
+    is_stock_or_convertible_bond: bool = Field(description="圖片是否包含股票或可轉債庫存／持倉資料")
     rows: list[ScreenshotHoldingRow]
     warnings: list[str]
 
@@ -698,13 +699,12 @@ def handle_screenshot_image(photo_file_id: str):
         image = _prepare_holdings_image(image_response.content)
 
         prompt = """
-你是台灣股票與可轉債券商庫存截圖的辨識助手。不同券商版面、欄位順序和欄位名稱可能不同；必須依表頭和每列內容判斷，不可依固定座標猜。
-逐列抽取：標的代碼、完整名稱、股數或張數、買進成交均價。
-名稱欄可能叫股名、股票名稱、標的名稱、商品名稱；代碼欄可能叫股票代號、代碼、證券代號。名稱和代碼可能在同一格，如「4108 懷特」，也可能分欄。
-數量欄可能叫股數、持有股數、庫存股數、持倉數量、張數或持有張數。依券商畫面辨識單位是股或張；看不出來要填未知，不可只看數字猜。
-買進單價欄可能叫成交均價、買進均價、買入均價、平均成本、成本單價、買進價格、買入價格。不可把現價、市價、投資成本總額、帳面收入、損益或報酬率當成買進均價。
-代碼須保留原有所有數字與前導零。可轉債代碼可為5或6位數，不能丟掉末碼；可轉債完整名稱可能在股票名稱後加一、二、三、四、五、六等序號。
-只抽實際持倉列，略過表頭、合計、現金和總結。必要欄位不清楚時回傳 null 並記錄 warnings，不要猜；evidence 簡短寫出表頭和該列依據。
+你是台灣股票與可轉債券商庫存截圖辨識助手。不同券商版面可能不同，請讀懂欄位文字和每列內容，不可依固定位置猜。
+先判斷圖片是否真的包含股票或可轉債的庫存／持倉資料，填入 is_stock_or_convertible_bond。若是無關圖片，設為 false、rows 回傳空陣列。
+只要能確認「股票或可轉債標的（代碼或名稱）」以及「買進／持倉成本單價」，就可以列為一筆；畫面被裁切、看不到完整表頭或數量，不代表辨識失敗。標的代碼和名稱可能同一格，例如「622010 岳豐十」。股票代碼常為4位，可轉債代碼可為5或6位；保留所有數字、尾碼和前導零。可轉債名稱可能是在發行公司名稱後加一到十等序號，例如「岳豐十」。
+價格可從明確的買進／成本單價欄辨識，欄名可能是：CB成本價、成本價、庫存成本價、持倉成本價、買入價、買進價、買入價格、買進價格、買入均價、買進均價、成交價、成交均價、平均成本或成本單價。不能把現價、市價、委買價、委賣價、總投資成本、帳面收入、損益或報酬率當成買進成本單價。請依欄名和該列位置判斷。
+股數或張數不是必要欄位。若畫面沒有數量，quantity 回傳 null、quantity_unit 回傳「未知」，不要因此漏掉這筆；程式會預設 1 張。若看得到數量，辨識原數字與股／張單位；不可猜測單位。只抽實際持倉列，略過表頭、合計、現金和總結。
+若無法確認標的身分或買進／成本單價，該列欄位回傳 null 並在 warnings 說明；不要猜。confidence 要依畫面真實清晰度填寫。evidence 簡短記錄辨識依據。
 """
         response = client.models.generate_content(
             model="gemini-3.5-flash-lite",
@@ -719,64 +719,114 @@ def handle_screenshot_image(photo_file_id: str):
             send_telegram("⚠️ AI 沒有回傳可讀結果，沒有新增庫存。請傳送表頭與資料列清楚的截圖。")
             return
         extraction = ScreenshotHoldings.model_validate_json(response.text)
-        if not extraction.rows:
-            send_telegram("⚠️ 圖片中沒有可辨識的持倉列，沒有新增庫存。")
+        failure_message = (
+            "❌ 辨識失敗：這張圖片看起來不是股票／可轉債庫存資料，"
+            "或找不到可確認的標的與買進／成本單價。請重新上傳正確、清楚的圖片。"
+        )
+        if not extraction.is_stock_or_convertible_bond or not extraction.rows:
+            send_telegram(failure_message)
             return
 
         rows, issues = [], []
+        cb_suffixes = [
+            ("一", "1"), ("二", "2"), ("三", "3"), ("四", "4"), ("五", "5"),
+            ("六", "6"), ("七", "7"), ("八", "8"), ("九", "9"), ("十", "10"),
+        ]
         for i, row in enumerate(extraction.rows, 1):
             code = re.sub(r"[^0-9]", "", str(row.stock_code or ""))
             name = str(row.stock_name or "").strip()
+
+            # 代碼沒拍到時，嘗試用完整股票名稱，或「公司名＋可轉債序號」唯一反查。
+            if not code and name:
+                name_norm = _normalise_label(name)
+                stock_matches = [
+                    stock_code for stock_code, stock_info in twstock.codes.items()
+                    if _normalise_label(stock_info.name) == name_norm
+                ]
+                if len(stock_matches) == 1:
+                    code = stock_matches[0]
+                else:
+                    cb_matches = []
+                    for base_code, stock_info in twstock.codes.items():
+                        for chinese_suffix, numeric_suffix in cb_suffixes:
+                            expected_name = _normalise_label(stock_info.name + chinese_suffix)
+                            if expected_name == name_norm:
+                                cb_matches.append(base_code + numeric_suffix)
+                    if len(cb_matches) == 1:
+                        code = cb_matches[0]
+
             if len(code) not in (4, 5, 6):
-                issues.append(f"第{i}列代碼不清楚或格式錯誤")
+                issues.append(f"第{i}列無法確認股票／可轉債代碼")
                 continue
             code, official_name = get_stock_info(code)
             if not code or official_name == code or official_name.startswith("可轉債"):
                 issues.append(f"第{i}列代碼無法核對")
                 continue
-            if not name or row.quantity is None or row.quantity <= 0 or row.average_buy_price is None or row.average_buy_price <= 0:
-                issues.append(f"第{i}列名稱、數量或買進均價不完整")
+            if row.average_buy_price is None or row.average_buy_price <= 0:
+                issues.append(f"第{i}列找不到可確認的買進／成本單價")
                 continue
             if row.confidence == "low":
-                issues.append(f"第{i}列辨識把握低")
-                continue
-            name_norm, official_norm = _normalise_label(name), _normalise_label(official_name)
-            base_name = get_stock_info(code[:4])[1] if len(code) in (5, 6) else official_name
-            base_norm = _normalise_label(base_name)
-            if not (name_norm in official_norm or official_norm in name_norm or name_norm in base_norm or base_norm in name_norm):
-                issues.append(f"第{i}列名稱「{name}」和代碼對應名稱「{official_name}」不符")
+                issues.append(f"第{i}列標的或價格辨識把握低")
                 continue
 
-            source_qty = int(row.quantity)
-            if row.quantity_unit == "股":
-                qty = (source_qty + 999) // 1000
-            elif row.quantity_unit == "張":
-                qty = source_qty
+            # 有名稱時檢查是否與代碼相符；只有代碼時採用代碼資料庫中的正式名稱。
+            if name:
+                name_norm, official_norm = _normalise_label(name), _normalise_label(official_name)
+                base_name = get_stock_info(code[:4])[1] if len(code) in (5, 6) else official_name
+                base_norm = _normalise_label(base_name)
+                if not (
+                    name_norm in official_norm or official_norm in name_norm
+                    or name_norm in base_norm or base_norm in name_norm
+                ):
+                    issues.append(f"第{i}列名稱「{name}」和代碼對應名稱「{official_name}」不符")
+                    continue
+
+            quantity_defaulted = row.quantity is None
+            if quantity_defaulted:
+                qty = 1
+                source_qty = None
+                source_unit = None
             else:
-                issues.append(f"第{i}列股數／張數單位無法確認")
-                continue
+                source_qty = int(row.quantity)
+                if source_qty <= 0:
+                    issues.append(f"第{i}列數量格式錯誤")
+                    continue
+                if row.quantity_unit == "股":
+                    qty = (source_qty + 999) // 1000
+                    source_unit = "股"
+                elif row.quantity_unit in {"張", "手"}:
+                    qty = source_qty
+                    source_unit = row.quantity_unit
+                else:
+                    issues.append(f"第{i}列股數／張數單位無法確認")
+                    continue
+
             rows.append({
                 "stock_code": code, "stock_name": official_name,
                 "buy_price": float(row.average_buy_price), "quantity": qty,
-                "source_quantity": source_qty, "source_unit": row.quantity_unit,
+                "source_quantity": source_qty, "source_unit": source_unit,
+                "quantity_defaulted": quantity_defaulted,
                 "confidence": row.confidence, "evidence": row.evidence,
             })
 
         if issues or len(rows) != len(extraction.rows):
             send_telegram(
-                "⚠️ 有欄位不清楚或名稱、代碼對不上，為避免建錯庫存，這張圖完全沒有新增。\n"
+                "❌ 辨識未完成，為避免建立錯誤庫存，這張圖沒有新增任何資料。\n"
                 + "\n".join("• " + x for x in issues[:10])
-                + "\n請傳送裁切清楚的截圖，或手動輸入資料。"
+                + "\n請重新上傳能看清標的代碼／名稱與買進或成本單價的股票／可轉債圖片。"
             )
             return
 
         preview = ["🔎 AI 辨識草稿：請勾選想匯入的項目，確認前不會新增庫存。"]
         for i, row in enumerate(rows, 1):
-            q = f"{row['source_quantity']} {row['source_unit']}"
-            if row["source_unit"] == "股":
-                q += f"（換算 {row['quantity']} 張，未滿1張無條件進位）"
+            if row["quantity_defaulted"]:
+                q = "未提供數量（預設 1 張）"
+            else:
+                q = f"{row['source_quantity']} {row['source_unit']}"
+                if row["source_unit"] == "股":
+                    q += f"（換算 {row['quantity']} 張，未滿1張無條件進位）"
             mark = "（請特別核對）" if row["confidence"] == "medium" else ""
-            preview.append(f"{i}. {row['stock_name']} ({row['stock_code']})｜{q}｜買進均價 {row['buy_price']:.2f} 元{mark}")
+            preview.append(f"{i}. {row['stock_name']} ({row['stock_code']})｜{q}｜買進／成本價 {row['buy_price']:.2f} 元{mark}")
             if row["evidence"]:
                 preview.append(f"   辨識依據：{row['evidence']}")
         preview.extend(["", "目前全部已勾選；取消不需要的項目，再按「確認匯入」。"])
