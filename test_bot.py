@@ -5,8 +5,7 @@ import re
 import threading
 import io
 from pathlib import Path
-from datetime import datetime, time as dtime
-from zoneinfo import ZoneInfo
+from datetime import date, datetime, time as dtime, timezone
 from contextlib import contextmanager
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import psycopg2
@@ -65,10 +64,6 @@ DEFAULT_TAKE_PROFIT_PERCENT = 11.0
 DEFAULT_TRAILING_STOP_PERCENT = 6.0
 DEFAULT_TRAILING_ACTIVATION_PERCENT = 3.0
 DEFAULT_WARNING_BUFFER_PERCENT = 1.0
-TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-
-def taipei_now():
-    return datetime.now(TAIPEI_TZ)
 
 def get_stock_info(identifier: str):
     if not identifier:
@@ -78,15 +73,10 @@ def get_stock_info(identifier: str):
     if identifier in twstock.codes:
         return identifier, twstock.codes[identifier].name
     
-    if len(identifier) in (5, 6) and identifier.isdigit():
+    if len(identifier) == 5 and identifier.isdigit():
         base_code = identifier[:4]
-        cb_suffix = identifier[4:] if len(identifier) == 6 else identifier[4]
-        suffix_map = {
-            '1': '一', '01': '一', '2': '二', '02': '二', '3': '三', '03': '三',
-            '4': '四', '04': '四', '5': '五', '05': '五', '6': '六', '06': '六',
-            '7': '七', '07': '七', '8': '八', '08': '八', '9': '九', '09': '九',
-            '0': '十', '10': '十',
-        }
+        cb_suffix = identifier[4]
+        suffix_map = {'1': '一', '2': '二', '3': '三', '4': '四', '5': '五', '6': '六', '7': '七', '8': '八', '9': '九', '0': '十'}
         name_suffix = suffix_map.get(cb_suffix, 'CB')
         if base_code in twstock.codes:
             cb_name = f"{twstock.codes[base_code].name}{name_suffix}"
@@ -100,7 +90,7 @@ def get_stock_info(identifier: str):
     return identifier, identifier
 
 def is_market_open() -> bool:
-    now = taipei_now()
+    now = datetime.now()
     if now.weekday() >= 5:
         return False
     market_start = dtime(9, 0, 0)
@@ -108,7 +98,7 @@ def is_market_open() -> bool:
     return market_start <= now.time() <= market_end
 
 def is_market_closing_time() -> bool:
-    now = taipei_now()
+    now = datetime.now()
     if now.weekday() >= 5:
         return False
     return dtime(13, 40, 0) <= now.time() <= dtime(13, 45, 0)
@@ -122,7 +112,8 @@ def init_db_schema():
                 ADD COLUMN IF NOT EXISTS warning_buffer_percent NUMERIC DEFAULT 1.0,
                 ADD COLUMN IF NOT EXISTS warning_sl_price NUMERIC,
                 ADD COLUMN IF NOT EXISTS warning_tp_price NUMERIC,
-                ADD COLUMN IF NOT EXISTS ts_activation_percent NUMERIC DEFAULT 3.0;
+                ADD COLUMN IF NOT EXISTS ts_activation_percent NUMERIC DEFAULT 3.0,
+                ADD COLUMN IF NOT EXISTS monitoring_started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
                 
                 CREATE TABLE IF NOT EXISTS daily_reports (
                     report_date DATE PRIMARY KEY,
@@ -209,9 +200,21 @@ def send_telegram(text: str, silent: bool = False, reply_markup=None, chat_id=No
 def get_market_quote(code: str):
     code, name = get_stock_info(code)
     if not code:
-        return None, None, None, None
+        return None, None, None, None, None
 
-    if len(code) in (5, 6) and code.isdigit():
+    def quote_time(value):
+        """Convert provider epoch timestamps (seconds or Fugle microseconds) to UTC."""
+        if value is None:
+            return None
+        try:
+            timestamp = float(value)
+            if timestamp > 100_000_000_000:
+                timestamp /= 1_000_000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    if len(code) == 5 and code.isdigit():
         try:
             url_fugle_cb = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{code}"
             headers = {"X-API-KEY": FUGLE_TOKEN, "Connection": "close"}
@@ -220,7 +223,8 @@ def get_market_quote(code: str):
                 d = resp_f.json()
                 price = d.get("closePrice") or d.get("lastUpdatedPrice") or (d.get("trade", {}).get("price") if isinstance(d.get("trade"), dict) else None)
                 if price:
-                    return name, float(price), float(d.get("highPrice", price)), float(d.get("lowPrice", price))
+                    trade_time = d.get("closeTime") or (d.get("lastTrade", {}).get("time") if isinstance(d.get("lastTrade"), dict) else None)
+                    return name, float(price), float(d.get("highPrice", price)), float(d.get("lowPrice", price)), quote_time(trade_time)
         except Exception:
             pass
 
@@ -236,7 +240,7 @@ def get_market_quote(code: str):
                         meta = result[0]["meta"]
                         price = meta.get("regularMarketPrice")
                         if price:
-                            return name, float(price), float(meta.get("regularMarketDayHigh", price)), float(meta.get("regularMarketDayLow", price))
+                            return name, float(price), float(meta.get("regularMarketDayHigh", price)), float(meta.get("regularMarketDayLow", price)), quote_time(meta.get("regularMarketTime"))
             except Exception:
                 pass
 
@@ -256,7 +260,8 @@ def get_market_quote(code: str):
                 high = d.get("highPrice")
                 low = d.get("lowPrice")
                 if price:
-                    return name, float(price), float(high) if high else float(price), float(low) if low else float(price)
+                    trade_time = d.get("closeTime") or (d.get("lastTrade", {}).get("time") if isinstance(d.get("lastTrade"), dict) else None)
+                    return name, float(price), float(high) if high else float(price), float(low) if low else float(price), quote_time(trade_time)
         except Exception:
             pass
 
@@ -274,17 +279,17 @@ def get_market_quote(code: str):
                     high = meta.get("regularMarketDayHigh")
                     low = meta.get("regularMarketDayLow")
                     if price:
-                        return name, float(price), float(high) if high else float(price), float(low) if low else float(price)
+                        return name, float(price), float(high) if high else float(price), float(low) if low else float(price), quote_time(meta.get("regularMarketTime"))
         except Exception:
             pass
 
-    return name, None, None, None
+    return name, None, None, None, None
 
 def get_portfolio_summary_text(filter_keyword: str = None, sort_by_profit: bool = False) -> str:
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            today = taipei_now().date()
+            today = date.today()
 
             cur.execute("""
                 SELECT lot_id, stock_code, stock_name, buy_price, quantity, 
@@ -309,9 +314,10 @@ def get_portfolio_summary_text(filter_keyword: str = None, sort_by_profit: bool 
             notif_rows = cur.fetchall()
             cur.close()
 
-            triggered_map = {}
+        triggered_map = {}
         for r_lot_id, r_event in notif_rows:
-            triggered_map.setdefault(r_lot_id, set()).add(r_event)
+            if r_lot_id not in triggered_map or triggered_map[r_lot_id].startswith("APPROACHING"):
+                triggered_map[r_lot_id] = r_event
 
         parsed_items = []
         for r in lots:
@@ -336,7 +342,7 @@ def get_portfolio_summary_text(filter_keyword: str = None, sort_by_profit: bool 
                 if not matched_kw:
                     continue
 
-            _, cur_price, _, _ = get_market_quote(code)
+            _, cur_price, _, _, _ = get_market_quote(code)
             if cur_price is not None:
                 cur_price = float(cur_price)
                 diff_val = cur_price - buy_price
@@ -348,29 +354,25 @@ def get_portfolio_summary_text(filter_keyword: str = None, sort_by_profit: bool 
                 diff_pct = 0.0
                 price_line = "  最新成交：查無即時行情"
 
-            event_types = triggered_map.get(lot_id, set())
+            event_type = triggered_map.get(lot_id)
             icon = "🔹"
-            event_labels = {
-                'STOP_LOSS': ("🔴", "停損已觸發"),
-                'TAKE_PROFIT': ("🟡", "停利已觸發"),
-                'TRAILING_STOP': ("🟠", "移動停利已觸發"),
-                'APPROACHING_STOP_LOSS': ("🔸", "停損預警已觸發"),
-                'APPROACHING_TAKE_PROFIT': ("🔸", "停利預警已觸發"),
-            }
-            display_order = (
-                'STOP_LOSS', 'TAKE_PROFIT', 'TRAILING_STOP',
-                'APPROACHING_STOP_LOSS', 'APPROACHING_TAKE_PROFIT',
-            )
-            status_lines = [f"  今日觸發：{event_labels[event][1]}" for event in display_order if event in event_types]
-            if 'STOP_LOSS' in event_types:
+            status_line = ""
+
+            if event_type == 'STOP_LOSS':
                 icon = "🔴"
-            elif 'TAKE_PROFIT' in event_types:
+                status_line = "\n\n  今日狀態：🚨 盤中已觸發停損防線，請儘速處理！"
+            elif event_type == 'TAKE_PROFIT':
                 icon = "🟡"
-            elif 'TRAILING_STOP' in event_types:
+                status_line = "\n\n  今日狀態：🎉 盤中已觸發停利目標，可分批入袋！"
+            elif event_type == 'TRAILING_STOP':
                 icon = "🟠"
-            elif event_types:
+                status_line = "\n\n  今日狀態：⚠️ 盤中已觸發移動停利，請獲利入袋！"
+            elif event_type == 'APPROACHING_STOP_LOSS':
                 icon = "🔸"
-            status_line = "\n\n" + "\n".join(status_lines) if status_lines else ""
+                status_line = "\n\n  今日狀態：⚠️ 盤中逼近停損防線"
+            elif event_type == 'APPROACHING_TAKE_PROFIT':
+                icon = "🔸"
+                status_line = "\n\n  今日狀態：🎯 盤中逼近停利目標"
 
             warn_info = []
             if w_sl_p:
@@ -439,7 +441,7 @@ def extract_trade_intent(user_text: str):
     prompt = (
         "你是一個台灣股市 AI 交易管家助理。請分析使用者的這句話，並嚴格以純 JSON 格式回傳結果（絕對不要包含 ```json 或任何 markdown 標記，只要輸出大括號 {} 內部的 JSON）。\n\n"
         "支援的 action 類型：\n"
-        "- \"ADD_LOT\": 買進建倉。需包含欄位: \"stock_code\" (4碼股票代號或5/6碼可轉債代號，請依中文名稱查出正確代號；可轉債代碼必須保留所有前導零及末尾數字，不可截短或轉成數值，例如岳豐十=622010，代碼一律當文字), \"stock_name\" (股票名稱), \"buy_price\" (買進價格，浮點數), \"quantity\" (張數，整數，若未寫預設為 1)\n"
+        "- \"ADD_LOT\": 買進建倉。需包含欄位: \"stock_code\" (4碼股票代號或5碼可轉債代號，請根據股票中文名稱自動查出正確代號，例如 臺企銀=2834, 台積電=2330, 聯發科=2454 等), \"stock_name\" (股票名稱), \"buy_price\" (買進價格，浮點數), \"quantity\" (張數，整數，若未寫預設為 1)\n"
         "- \"SELL_LOT\": 賣出/平倉。需包含欄位: \"stock_code\", \"sell_price\", \"quantity\"\n"
         "- \"QUERY_PORTFOLIO_FILTERED\": 查詢庫存。需包含欄位: \"filter_keyword\" (過濾關鍵字), \"sort_by_profit\" (布林值，是否依獲利排序)\n"
         "- \"GET_PRICE\": 查現價。需包含欄位: \"stock_code\"\n"
@@ -465,11 +467,6 @@ def extract_trade_intent(user_text: str):
         
         if result.get("action") == "ADD_LOT":
             raw_code = result.get("stock_code")
-            # If the user typed the full six-digit CB code, trust that exact text
-            # over an LLM response that may have dropped its final zero.
-            explicit_six_digit_code = re.search(r"(?<!\d)\d{6}(?!\d)", clean_text)
-            if explicit_six_digit_code:
-                raw_code = explicit_six_digit_code.group(0)
             c_code, c_name = get_stock_info(raw_code)
             result["stock_code"] = c_code
             result["stock_name"] = c_name
@@ -497,7 +494,7 @@ def handle_screenshot_image(photo_file_id: str):
         這是一張台灣股市或可轉債的券商 App 庫存明細截圖。
         請幫我找出畫面中所有的持股資料，並嚴格以 JSON 格式回傳一個列表（List），不要包含額外文字。
         每個物件包含以下欄位：
-        - "stock_id": 股票或可轉債的 4、5 或 6 碼代號（例如 "2330", "12331", "622010"）；代碼須保留為字串，不得省略末尾的 0。
+        - "stock_id": 股票或可轉債的 4 碼或 5 碼代號（例如 "2330", "12331"）
         - "shares": 持有股數（整數，系統預設以 1 張為 1 單位，若無法判定張數請回傳 1）
         - "cost": 平均成本價（浮點數，若無則填 0.0）
         格式範例：
@@ -529,7 +526,7 @@ def handle_screenshot_image(photo_file_id: str):
                     }
                     handle_add_lot(add_data)
                 else:
-                    _, cur_p, _, _ = get_market_quote(s_id)
+                    _, cur_p, _, _, _ = get_market_quote(s_id)
                     add_data = {
                         "stock_code": s_id,
                         "buy_price": cur_p or 100.0,
@@ -796,7 +793,7 @@ def handle_close_all_positions():
             total_pnl = 0.0
             skipped = []
             for lot_id, code, stock_name, buy_price, quantity in rows:
-                _, market_price, _, _ = get_market_quote(code)
+                _, market_price, _, _, _ = get_market_quote(code)
                 if market_price is None:
                     skipped.append(f"{stock_name or code} ({code})")
                     continue
@@ -1018,7 +1015,7 @@ def handle_sell_multi_lots(data: dict):
 
                 sell_price = custom_sell_price
                 if not sell_price:
-                    _, market_p, _, _ = get_market_quote(code)
+                _, market_p, _, _, _ = get_market_quote(code)
                     sell_price = market_p
 
                 if not sell_price:
@@ -1077,7 +1074,7 @@ def handle_sell_lot(data: dict):
         return
 
     if not sell_price:
-        _, market_p, _, _ = get_market_quote(code)
+        _, market_p, _, _, _ = get_market_quote(code)
         sell_price = market_p
 
     if not sell_price:
@@ -1183,7 +1180,7 @@ def handle_add_lot(data: dict):
                  ts_activation_percent)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'MONITORING', %s, %s)
                 RETURNING lot_id;
-            """, (code, name, taipei_now().date(), buy_price, qty, tp_pct, sl_pct, ts_pct, tp_price, sl_price, buy_price, wb_pct, ts_act_pct))
+            """, (code, name, date.today(), buy_price, qty, tp_pct, sl_pct, ts_pct, tp_price, sl_price, buy_price, wb_pct, ts_act_pct))
             lot_id = cur.fetchone()[0]
 
             cur.execute("""
@@ -1221,112 +1218,57 @@ def handle_get_price(data: dict):
         send_telegram("⚠️ 未能判斷查詢標的。")
         return
 
-    _, price, _, _ = get_market_quote(code)
+    _, price, _, _, _ = get_market_quote(code)
     if price is None:
         send_telegram(f"❌ 市場查無 {name} ({code}) 行情。")
     else:
         send_telegram(f"📊 【市場即時行情】\n\n• 標的：{name} ({code})\n• 最新成交價：{price:.2f} 元")
 
-def send_daily_market_report(closing_report: bool = False):
-    today = taipei_now().date()
+def send_daily_market_report():
+    today = date.today()
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            if closing_report:
-                cur.execute("SELECT 1 FROM daily_reports WHERE report_date = %s;", (today,))
-                if cur.fetchone():
-                    cur.close()
-                    return
+            cur.execute("SELECT 1 FROM daily_reports WHERE report_date = %s;", (today,))
+            if cur.fetchone():
+                cur.close()
+                return
 
             cur.execute("""
-                SELECT event_type, COUNT(*)
+                SELECT event_type, COUNT(*) 
                 FROM notification_records 
                 WHERE trade_date = %s 
                 GROUP BY event_type;
             """, (today,))
             ev_counts = dict(cur.fetchall())
 
-            cur.execute("""
-                SELECT n.lot_id, COALESCE(p.stock_name, p.stock_code, '未知標的'),
-                       p.stock_code, n.event_type, n.trigger_price
-                FROM notification_records n
-                LEFT JOIN position_lots p ON p.lot_id = n.lot_id
-                WHERE n.trade_date = %s
-                ORDER BY n.lot_id, n.event_type;
-            """, (today,))
-            event_rows = cur.fetchall()
-
             sl_cnt = ev_counts.get('STOP_LOSS', 0)
             tp_cnt = ev_counts.get('TAKE_PROFIT', 0)
             ts_cnt = ev_counts.get('TRAILING_STOP', 0)
             warn_cnt = ev_counts.get('APPROACHING_STOP_LOSS', 0) + ev_counts.get('APPROACHING_TAKE_PROFIT', 0)
 
+            cur.execute("INSERT INTO daily_reports (report_date) VALUES (%s);", (today,))
+            conn.commit()
             cur.close()
 
-        event_names = {
-            'STOP_LOSS': '停損觸發',
-            'TAKE_PROFIT': '停利觸發',
-            'TRAILING_STOP': '移動停利觸發',
-            'APPROACHING_STOP_LOSS': '停損預警',
-            'APPROACHING_TAKE_PROFIT': '停利預警',
-        }
-        details = [
-            f"• 第 {lot_id} 筆｜{stock_name} ({stock_code or '代碼未知'})｜{event_names.get(event_type, event_type)}"
-            + (f"｜觸發價 {float(trigger_price):.2f} 元" if trigger_price is not None else "")
-            for lot_id, stock_name, stock_code, event_type, trigger_price in event_rows
-        ]
         report_msg = (
             f"📊 【{today.strftime('%Y-%m-%d')} 今日風控觸發統計】\n\n"
             f"• 停損觸發：{sl_cnt} 次\n"
             f"• 停利達標：{tp_cnt} 次\n"
             f"• 移動停利：{ts_cnt} 次\n"
             f"• 接近預警：{warn_cnt} 次\n\n"
-            + ("📌 今日觸發標的：\n" + "\n".join(details) + "\n\n" if details else "📌 今日沒有觸發紀錄。\n\n")
-            + f"🛡 今日盯盤結束，祝您投資順心！"
+            f"🛡 今日盯盤結束，祝您投資順心！"
         )
-        if send_telegram(report_msg) is None:
-            print("❌ 今日收盤日報未送達，稍後將重試。", flush=True)
-            return
-
-        if closing_report:
-            with get_db_connection() as conn:
-                cur = conn.cursor()
-                cur.execute("INSERT INTO daily_reports (report_date) VALUES (%s) ON CONFLICT (report_date) DO NOTHING;", (today,))
-                conn.commit()
-                cur.close()
-            print("📢 今日收盤日報已成功發送！", flush=True)
-        else:
-            print("📢 手動風控統計已成功發送！", flush=True)
+        send_telegram(report_msg)
+        print("📢 今日風控統計日報已成功發送！")
 
     except Exception as e:
         print(f"❌ 統計發送失敗：{e}")
 
-def send_monitor_alert(cur, conn, lot_id, trade_day, event_type, trigger_price, message):
-    """Only suppress an alert after Telegram confirms successful delivery."""
-    is_warning = event_type.startswith("APPROACHING_")
-    delivery_count = 1 if is_warning else 2
-    for attempt in range(delivery_count):
-        alert_message = message if attempt == 0 else "🚨【已觸價，請紀律出場！】🚨"
-        result = send_telegram(alert_message, silent=False)
-        if result is None:
-            print(f"❌ {event_type} 第 {attempt + 1} 次通知未送達，第 {lot_id} 筆將在下次巡檢重試", flush=True)
-            return False
-        if attempt + 1 < delivery_count:
-            time.sleep(1)
-
-    cur.execute(
-        "INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, %s, %s);",
-        (lot_id, trade_day, event_type, trigger_price),
-    )
-    conn.commit()
-    print(f"✅ {event_type} 通知已由 Telegram 接收，第 {lot_id} 筆", flush=True)
-    return True
-
 def background_monitor():
-    print(f"🕘 價格監控使用台北時間，啟動時間 {taipei_now():%Y-%m-%d %H:%M:%S}", flush=True)
     while True:
         if is_market_closing_time():
-            send_daily_market_report(closing_report=True)
+            send_daily_market_report()
 
         if not is_market_open():
             time.sleep(120)
@@ -1339,28 +1281,32 @@ def background_monitor():
                     SELECT lot_id, stock_code, stock_name, buy_price, stop_loss_price, 
                            take_profit_price, quantity, stop_loss_percent, take_profit_percent, 
                            highest_price, trailing_stop_percent, warning_buffer_percent, 
-                           warning_sl_price, warning_tp_price, ts_activation_percent
+                           warning_sl_price, warning_tp_price, ts_activation_percent,
+                           monitoring_started_at
                     FROM position_lots 
                     WHERE monitoring_status = 'MONITORING';
                 """)
                 lots = cur.fetchall()
 
                 for lot in lots:
-                    lot_id, code, _, buy_p, sl_p, tp_p, qty, sl_pct, tp_pct, high_p, ts_pct, wb_pct, w_sl_p, w_tp_p, ts_act_p = lot
+                    lot_id, code, _, buy_p, sl_p, tp_p, qty, sl_pct, tp_pct, high_p, ts_pct, wb_pct, w_sl_p, w_tp_p, ts_act_p, monitoring_started_at = lot
                     _, name = get_stock_info(code)
-                    _, cur_price, day_high, day_low = get_market_quote(code)
-                    if cur_price is None:
-                        print(f"⚠️ 台北時間 {taipei_now():%H:%M:%S} 行情取得失敗，跳過第 {lot_id} 筆 ({code}) 風控檢查", flush=True)
+                    _, cur_price, day_high, day_low, quote_time = get_market_quote(code)
+                    if not cur_price:
                         continue
 
-                    cur_price = float(cur_price)
-                    session_high = float(day_high) if day_high is not None else cur_price
-                    session_low = float(day_low) if day_low is not None else cur_price
-                    today = taipei_now().date()
+                    if quote_time is None:
+                        print(f"⚠️ {code} 行情沒有可確認的成交時間，略過風控檢查，避免使用舊行情觸發通知", flush=True)
+                        continue
+                    if quote_time <= monitoring_started_at:
+                        print(f"ℹ️ {code} 最新成交時間早於或等於監控建立時間，略過本次風控檢查", flush=True)
+                        continue
+
+                    today = date.today()
                     buy_val = float(buy_p)
                     sl_val = float(sl_p)
                     tp_val = float(tp_p)
-                    previous_high_val = float(high_p) if high_p else buy_val
+                    high_val = float(high_p) if high_p else buy_val
                     ts_val = float(ts_pct) if ts_pct else DEFAULT_TRAILING_STOP_PERCENT
                     wb_val = float(wb_pct) if wb_pct is not None else DEFAULT_WARNING_BUFFER_PERCENT
                     w_sl_val = float(w_sl_p) if w_sl_p is not None else None
@@ -1368,18 +1314,18 @@ def background_monitor():
                     ts_act_val = float(ts_act_p) if ts_act_p is not None else DEFAULT_TRAILING_ACTIVATION_PERCENT
                     diff_pct = ((cur_price - buy_val) / buy_val) * 100
 
-                    high_val = max(previous_high_val, cur_price, session_high)
-                    if high_val > previous_high_val:
+                    if cur_price > high_val:
+                        high_val = cur_price
                         cur.execute("UPDATE position_lots SET highest_price = %s WHERE lot_id = %s;", (high_val, lot_id))
                         conn.commit()
 
                     trailing_stop_price = round(high_val * (1 - ts_val / 100), 2)
 
-                    is_hit_sl = (session_low <= sl_val)
+                    is_hit_sl = (cur_price <= sl_val)
                     if is_hit_sl:
                         cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'STOP_LOSS';", (lot_id, today))
                         if not cur.fetchone():
-                            actual_trigger_p = session_low
+                            actual_trigger_p = cur_price
                             trigger_diff_pct = ((actual_trigger_p - buy_val) / buy_val) * 100
                             sl_alert_msg = (
                                 f"🚨 【停損出場警報！】\n\n"
@@ -1387,18 +1333,19 @@ def background_monitor():
                                 f"• 標的：{name} ({code}) ({qty} 張)\n"
                                 f"• 買入成本：{buy_val:.1f} 元\n"
                                 f"• 停損防線：{sl_val:.1f} 元 (-{abs(float(sl_pct)):.1f}%)\n"
-                                f"• 目前現價：{cur_price:.2f} 元\n"
-                                f"• 盤中最低觸價：{actual_trigger_p:.2f} 元 ({trigger_diff_pct:.2f}%)\n\n"
+                                f"• 目前現價：{cur_price:.2f} 元 (觸發價: {actual_trigger_p:.2f}元, {trigger_diff_pct:.2f}%)\n\n"
                                 f"⚠️ 已跌破停損防線！請嚴守紀律果斷出場！"
                             )
-                            send_monitor_alert(cur, conn, lot_id, today, 'STOP_LOSS', actual_trigger_p, sl_alert_msg)
+                            send_telegram(sl_alert_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'STOP_LOSS', %s);", (lot_id, today, actual_trigger_p))
+                            conn.commit()
                         continue
 
-                    is_hit_tp = (session_high >= tp_val)
+                    is_hit_tp = (cur_price >= tp_val)
                     if is_hit_tp:
                         cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'TAKE_PROFIT';", (lot_id, today))
                         if not cur.fetchone():
-                            actual_trigger_p = session_high
+                            actual_trigger_p = cur_price
                             trigger_diff_pct = ((actual_trigger_p - buy_val) / buy_val) * 100
                             tp_alert_msg = (
                                 f"🎉 【停利達標警報！】\n\n"
@@ -1406,84 +1353,80 @@ def background_monitor():
                                 f"• 標的：{name} ({code}) ({qty} 張)\n"
                                 f"• 買入成本：{buy_val:.1f} 元\n"
                                 f"• 停利目標：{tp_val:.1f} 元 (+{abs(float(tp_pct)):.1f}%)\n"
-                                f"• 目前現價：{cur_price:.2f} 元\n"
-                                f"• 盤中最高觸價：{actual_trigger_p:.2f} 元 (+{trigger_diff_pct:.2f}%)\n\n"
+                                f"• 目前現價：{cur_price:.2f} 元 (達標價: {actual_trigger_p:.2f}元, +{trigger_diff_pct:.2f}%)\n\n"
                                 f"💰 獲利達標！可考慮分批獲利入袋！"
                             )
-                            send_monitor_alert(cur, conn, lot_id, today, 'TAKE_PROFIT', actual_trigger_p, tp_alert_msg)
+                            send_telegram(tp_alert_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'TAKE_PROFIT', %s);", (lot_id, today, actual_trigger_p))
+                            conn.commit()
                         continue
 
                     activation_price = buy_val * (1 + ts_act_val / 100)
                     has_reached_activation = high_val >= activation_price
-                    was_trailing_active = previous_high_val >= activation_price
-                    previous_trailing_stop_price = round(previous_high_val * (1 - ts_val / 100), 2)
 
-                    trailing_touched = cur_price <= trailing_stop_price or (
-                        was_trailing_active and session_low <= previous_trailing_stop_price
-                    )
-                    if has_reached_activation and trailing_touched:
+                    if has_reached_activation and cur_price <= trailing_stop_price:
                         cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'TRAILING_STOP';", (lot_id, today))
                         if not cur.fetchone():
-                            trail_trigger_price = min(cur_price, session_low) if was_trailing_active else cur_price
-                            trail_trigger_line = previous_trailing_stop_price if was_trailing_active else trailing_stop_price
                             ts_alert_msg = (
                                 f"🚨 【移動停利出場警報！】\n\n"
                                 f"• 庫存編號：【第 {lot_id} 筆】\n"
                                 f"• 標的：{name} ({code}) ({qty} 張)\n"
                                 f"• 買入成本：{buy_val:.1f} 元\n"
                                 f"• 啟動條件：曾達獲利 +{ts_act_val:.1f}% 門檻（最高 {high_val:.1f} 元）\n"
-                                f"• 移動防線：{trail_trigger_line:.1f} 元 (自高點回檔 -{ts_val:.1f}%)\n"
+                                f"• 移動防線：{trailing_stop_price:.1f} 元 (自高點回檔 -{ts_val:.1f}%)\n"
                                 f"• 目前現價：{cur_price:.2f} 元 ({diff_pct:.2f}%)\n\n"
                                 f"⚠️ 自最高點回檔觸發移動停利！請獲利入袋！"
                             )
-                            send_monitor_alert(cur, conn, lot_id, today, 'TRAILING_STOP', trail_trigger_price, ts_alert_msg)
+                            send_telegram(ts_alert_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'TRAILING_STOP', %s);", (lot_id, today, cur_price))
+                            conn.commit()
                         continue
 
                     is_warn_sl = False
                     if w_sl_val is not None:
-                        is_warn_sl = (session_low <= w_sl_val and session_low > sl_val)
+                        is_warn_sl = (cur_price <= w_sl_val and cur_price > sl_val)
                     else:
-                        dist_to_sl_pct = ((session_low - sl_val) / buy_val) * 100
+                        dist_to_sl_pct = ((cur_price - sl_val) / buy_val) * 100
                         is_warn_sl = (0 < dist_to_sl_pct <= wb_val)
 
                     is_warn_tp = False
                     if w_tp_val is not None:
-                        is_warn_tp = (session_high >= w_tp_val and session_high < tp_val)
+                        is_warn_tp = (cur_price >= w_tp_val and cur_price < tp_val)
                     else:
-                        dist_to_tp_pct = ((tp_val - session_high) / buy_val) * 100
+                        dist_to_tp_pct = ((tp_val - cur_price) / buy_val) * 100
                         is_warn_tp = (0 < dist_to_tp_pct <= wb_val)
 
                     if is_warn_sl:
                         cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'APPROACHING_STOP_LOSS';", (lot_id, today))
                         if not cur.fetchone():
-                            warning_touch_price = session_low
                             warn_sl_msg = (
                                 f"⚠️ 【接近停損防線預警】\n\n"
                                 f"• 庫存編號：【第 {lot_id} 筆】\n"
                                 f"• 標的：{name} ({code}) ({qty} 張)\n"
-                                f"• 目前現價：{cur_price:.2f} 元\n"
-                                f"• 盤中最低觸價：{warning_touch_price:.2f} 元 ({((warning_touch_price - buy_val) / buy_val) * 100:.2f}%)\n"
+                                f"• 目前現價：{cur_price:.2f} 元 ({diff_pct:.2f}%)\n"
                                 f"• 停損防線：{sl_val:.1f} 元 (-{abs(float(sl_pct)):.1f}%)\n"
-                                f"• 距離防線：僅剩 {warning_touch_price - sl_val:.2f} 元\n\n"
+                                f"• 距離防線：僅剩 {cur_price - sl_val:.2f} 元\n\n"
                                 f"⏳ 股價逼近停損，請做好出場準備。（即時預警通知）"
                             )
-                            send_monitor_alert(cur, conn, lot_id, today, 'APPROACHING_STOP_LOSS', warning_touch_price, warn_sl_msg)
+                            send_telegram(warn_sl_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'APPROACHING_STOP_LOSS', %s);", (lot_id, today, cur_price))
+                            conn.commit()
 
                     elif is_warn_tp:
                         cur.execute("SELECT 1 FROM notification_records WHERE lot_id = %s AND trade_date = %s AND event_type = 'APPROACHING_TAKE_PROFIT';", (lot_id, today))
                         if not cur.fetchone():
-                            warning_touch_price = session_high
                             warn_tp_msg = (
                                 f"🎯 【接近停利目標預警】\n\n"
                                 f"• 庫存編號：【第 {lot_id} 筆】\n"
                                 f"• 標的：{name} ({code}) ({qty} 張)\n"
-                                f"• 目前現價：{cur_price:.2f} 元\n"
-                                f"• 盤中最高觸價：{warning_touch_price:.2f} 元 (+{((warning_touch_price - buy_val) / buy_val) * 100:.2f}%)\n"
+                                f"• 目前現價：{cur_price:.2f} 元 (+{diff_pct:.2f}%)\n"
                                 f"• 停利目標：{tp_val:.1f} 元 (+{abs(float(tp_pct)):.1f}%)\n"
-                                f"• 距離目標：{tp_val - warning_touch_price:.2f} 元\n\n"
+                                f"• 距離目標：_{tp_val - cur_price:.2f} 元\n\n"
                                 f"⏳ 股價即將達標，可留意獲利賣單。（即時預警通知）"
                             )
-                            send_monitor_alert(cur, conn, lot_id, today, 'APPROACHING_TAKE_PROFIT', warning_touch_price, warn_tp_msg)
+                            send_telegram(warn_tp_msg, silent=False)
+                            cur.execute("INSERT INTO notification_records (lot_id, trade_date, event_type, trigger_price) VALUES (%s, %s, 'APPROACHING_TAKE_PROFIT', %s);", (lot_id, today, cur_price))
+                            conn.commit()
 
                 cur.close()
         except Exception as e:
@@ -1661,7 +1604,4 @@ def run_bot():
             safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
             print(f"❌ Telegram 主迴圈錯誤：{type(e).__name__}: {safe_error}")
 
-        time.sleep(1)
-
-if __name__ == "__main__":
-    run_bot()
+        tim
