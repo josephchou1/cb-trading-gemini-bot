@@ -60,11 +60,11 @@ def get_db_connection():
         if conn and db_pool:
             db_pool.putconn(conn)
 
-DEFAULT_STOP_LOSS_PERCENT = 3.0
-DEFAULT_TAKE_PROFIT_PERCENT = 11.0
+DEFAULT_STOP_LOSS_PERCENT = 5.0
+DEFAULT_TAKE_PROFIT_PERCENT = 15.0
 DEFAULT_TRAILING_STOP_PERCENT = 6.0
 DEFAULT_TRAILING_ACTIVATION_PERCENT = 3.0
-DEFAULT_WARNING_BUFFER_PERCENT = 1.0
+DEFAULT_WARNING_BUFFER_PERCENT = 1.5
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 def taipei_now():
@@ -119,7 +119,7 @@ def init_db_schema():
             cur = conn.cursor()
             cur.execute("""
                 ALTER TABLE position_lots 
-                ADD COLUMN IF NOT EXISTS warning_buffer_percent NUMERIC DEFAULT 1.0,
+                ADD COLUMN IF NOT EXISTS warning_buffer_percent NUMERIC DEFAULT 1.5,
                 ADD COLUMN IF NOT EXISTS warning_sl_price NUMERIC,
                 ADD COLUMN IF NOT EXISTS warning_tp_price NUMERIC,
                 ADD COLUMN IF NOT EXISTS ts_activation_percent NUMERIC DEFAULT 3.0,
@@ -143,6 +143,33 @@ def init_db_schema():
                     exit_reason VARCHAR(50),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS app_migrations (
+                    migration_key TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                DO $migration$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM app_migrations
+                        WHERE migration_key = 'defaults_sl5_tp15_warning1_5'
+                    ) THEN
+                        UPDATE position_lots
+                        SET stop_loss_percent = 5.0,
+                            stop_loss_price = ROUND(buy_price * 0.95, 2),
+                            take_profit_percent = 15.0,
+                            take_profit_price = ROUND(buy_price * 1.15, 2),
+                            warning_buffer_percent = 1.5,
+                            warning_sl_price = NULL,
+                            warning_tp_price = NULL
+                        WHERE monitoring_status = 'MONITORING';
+
+                        INSERT INTO app_migrations (migration_key)
+                        VALUES ('defaults_sl5_tp15_warning1_5');
+                    END IF;
+                END
+                $migration$;
             """)
             conn.commit()
             cur.close()
