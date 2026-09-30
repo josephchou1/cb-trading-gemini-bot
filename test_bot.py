@@ -212,29 +212,29 @@ def get_market_quote(code: str):
     if not code:
         return None, None, None, None, None, None, None
 
-
     def quote_time(value):
-    if len(code) in (5, 6) and code.isdigit():
         """Convert provider timestamps (seconds or Fugle microseconds) to UTC."""
-        try:
         if value is None:
-            url_fugle_cb = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{code}"
             return None
-            headers = {"X-API-KEY": FUGLE_TOKEN, "Connection": "close"}
         try:
-            resp_f = requests.get(url_fugle_cb, headers=headers, timeout=5)
             timestamp = float(value)
-            if resp_f.status_code == 200:
             if timestamp > 100_000_000_000:
-                d = resp_f.json()
                 timestamp /= 1_000_000
-                price = d.get("closePrice") or d.get("lastUpdatedPrice") or (d.get("trade", {}).get("price") if isinstance(d.get("trade"), dict) else None)
             return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    if len(code) in (5, 6) and code.isdigit():
+        try:
+            url_fugle_cb = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{code}"
+            headers = {"X-API-KEY": FUGLE_TOKEN, "Connection": "close"}
+            resp_f = requests.get(url_fugle_cb, headers=headers, timeout=5)
+            if resp_f.status_code == 200:
+                d = resp_f.json()
+                price = d.get("closePrice") or d.get("lastUpdatedPrice") or (d.get("trade", {}).get("price") if isinstance(d.get("trade"), dict) else None)
                 if price:
                     trade_time = d.get("closeTime") or (d.get("lastTrade", {}).get("time") if isinstance(d.get("lastTrade"), dict) else None)
-                    return name, float(price), float(d.get("highPrice", price)), float(d.get("lowPrice", price))
                     return name, float(price), float(d.get("highPrice", price)), float(d.get("lowPrice", price)), quote_time(trade_time), quote_time(d.get("highTime")), quote_time(d.get("lowTime"))
-            return None
         except Exception:
             pass
 
@@ -1370,30 +1370,30 @@ def background_monitor():
                         continue
 
                     if quote_time is None:
-                    cur_price = float(cur_price)
                         print(f"⚠️ {code} 行情沒有可確認的成交時間，略過風控檢查，避免使用舊行情觸發通知", flush=True)
-                    session_high = float(day_high) if day_high is not None else cur_price
                         continue
-                    session_low = float(day_low) if day_low is not None else cur_price
                     if quote_time <= monitoring_started_at:
-                    today = taipei_now().date()
                         print(f"ℹ️ {code} 最新成交時間早於或等於監控建立時間，略過本次風控檢查", flush=True)
-                    buy_val = float(buy_p)
                         continue
-                    sl_val = float(sl_p)
 
+                    cur_price = float(cur_price)
+                    session_high = float(day_high) if day_high is not None else cur_price
+                    session_low = float(day_low) if day_low is not None else cur_price
+                    today = taipei_now().date()
+                    if buy_date == today:
+                        # Use today's extremes only when their timestamps are after registration.
+                        session_high = float(day_high) if day_high_time and day_high_time > monitoring_started_at else cur_price
+                        session_low = float(day_low) if day_low_time and day_low_time > monitoring_started_at else cur_price
+                    buy_val = float(buy_p)
+                    sl_val = float(sl_p)
                     tp_val = float(tp_p)
                     previous_high_val = float(high_p) if high_p else buy_val
                     ts_val = float(ts_pct) if ts_pct else DEFAULT_TRAILING_STOP_PERCENT
                     wb_val = float(wb_pct) if wb_pct is not None else DEFAULT_WARNING_BUFFER_PERCENT
                     w_sl_val = float(w_sl_p) if w_sl_p is not None else None
-                    if buy_date == today:
                     w_tp_val = float(w_tp_p) if w_tp_p is not None else None
-                        # Use today's extremes only when their timestamps are after registration.
                     ts_act_val = float(ts_act_p) if ts_act_p is not None else DEFAULT_TRAILING_ACTIVATION_PERCENT
-                        session_high = float(day_high) if day_high_time and day_high_time > monitoring_started_at else cur_price
                     diff_pct = ((cur_price - buy_val) / buy_val) * 100
-                        session_low = float(day_low) if day_low_time and day_low_time > monitoring_started_at else cur_price
 
                     high_val = max(previous_high_val, cur_price, session_high)
                     if high_val > previous_high_val:
