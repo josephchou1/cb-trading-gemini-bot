@@ -779,11 +779,11 @@ def handle_screenshot_image(photo_file_id: str):
             preview.append(f"{i}. {row['stock_name']} ({row['stock_code']})｜{q}｜買進均價 {row['buy_price']:.2f} 元{mark}")
             if row["evidence"]:
                 preview.append(f"   辨識依據：{row['evidence']}")
-        preview.extend(["", "點擊每筆左側方框選取；也可用「全選」或「清除」。"])
+        preview.extend(["", "目前全部已勾選；取消不需要的項目，再按「確認匯入」。"])
         pending = {
             "token": uuid4().hex[:8],
             "rows": rows,
-            "selected": set(),
+            "selected": set(range(len(rows))),
             "message_id": None,
         }
         with PENDING_SCREENSHOT_LOCK:
