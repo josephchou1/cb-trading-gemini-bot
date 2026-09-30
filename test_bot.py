@@ -672,7 +672,7 @@ def handle_screenshot_image(photo_file_id: str):
         preview.extend(["", "正確請回覆「確認匯入」；要放棄請回覆「取消匯入」。"])
         with PENDING_SCREENSHOT_LOCK:
             PENDING_SCREENSHOT_IMPORTS[str(CHAT_ID)] = rows
-        send_telegram("\\n".join(preview))
+        send_telegram("\n".join(preview))
     except Exception as e:
         safe_error = str(e).replace(BOT_TOKEN, "<redacted>")
         print(f"❌ 截圖辨識失敗：{type(e).__name__}: {safe_error}", flush=True)
@@ -1744,7 +1744,7 @@ def run_bot():
                         if not text:
                             continue
 
-                        normalized_text = re.sub(r"[\\s，。！？、,.!?]+", "", text).lower()
+                        normalized_text = re.sub(r"[\s，。！？、,.!?]+", "", text).lower()
                         if normalized_text in {"確認匯入", "确认导入", "確認新增", "确认新增"}:
                             with PENDING_SCREENSHOT_LOCK:
                                 pending = PENDING_SCREENSHOT_IMPORTS.pop(str(CHAT_ID), None)
@@ -1760,9 +1760,9 @@ def run_bot():
                                     imported.append(f"第 {lot_id} 筆：{record['stock_name']} ({record['stock_code']})")
                             summary = "✅ 截圖匯入完成。"
                             if imported:
-                                summary += "\\n" + "\\n".join(imported)
+                                summary += "\n" + "\n".join(imported)
                             if failed:
-                                summary += "\\n\\n⚠️ 未能新增：" + "、".join(failed)
+                                summary += "\n\n⚠️ 未能新增：" + "、".join(failed)
                             send_telegram(summary, reply_markup=get_show_portfolio_markup())
                             continue
                         if normalized_text in {"取消匯入", "取消导入", "放棄匯入", "放弃导入"}:
