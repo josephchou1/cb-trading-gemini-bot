@@ -569,7 +569,7 @@ def _prepare_holdings_image(image_bytes: bytes):
     return image
 
 def _normalise_label(value):
-    return re.sub(r"[\\s0-9０-９（）()【】［］《》、，,。._・-]+", "", str(value or "")).lower()
+    return re.sub(r"[\s0-9０-９（）()【】［］《》、，,。._・-]+", "", str(value or "")).lower()
 
 def handle_screenshot_image(photo_file_id: str):
     try:
